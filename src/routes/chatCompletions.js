@@ -9,14 +9,22 @@ function waitForReply(pty, buffer) {
     let settled = false
     disposable = pty.onData((chunk) => {
       if (settled) return
-      buffer.push(chunk)
-      if (buffer.isReady()) {
-        settled = true
-        resolve(buffer.getReply())
-      }
+      buffer.push(chunk).then(() => {
+        if (settled) return
+        if (buffer.isReady()) {
+          settled = true
+          resolve(buffer.getReply())
+        }
+      })
     })
   })
-  return { promise, dispose: () => disposable?.dispose?.() }
+  return {
+    promise,
+    dispose: () => {
+      disposable?.dispose?.()
+      buffer.dispose?.()
+    },
+  }
 }
 
 function isValidChatRequest(body) {

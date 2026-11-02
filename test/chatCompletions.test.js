@@ -4,6 +4,10 @@ import request from 'supertest'
 import { createChatCompletionsRouter } from '../src/routes/chatCompletions.js'
 import { createSessionManager } from '../src/sessionManager.js'
 
+function doneChunk(reply) {
+  return `● ${reply}\r\n✻ Brewed for 1s · done 6:15 PM\r\n`
+}
+
 function appWithFakePty(onDataHandlerBox) {
   const disposeSpy = vi.fn()
   const writeSpy = vi.fn()
@@ -30,7 +34,7 @@ describe('POST /v1/chat/completions', () => {
     })
     const [res] = await Promise.all([
       reqPromise,
-      vi.waitUntil(() => box.cb).then(() => box.cb('Hi there!\n❯ ')),
+      vi.waitUntil(() => box.cb).then(() => box.cb(doneChunk('Hi there!'))),
     ])
     expect(res.status).toBe(200)
     expect(res.body.choices[0].message.content).toBe('Hi there!')
@@ -46,7 +50,7 @@ describe('POST /v1/chat/completions', () => {
     })
     await Promise.all([
       reqPromise,
-      vi.waitUntil(() => box.cb).then(() => box.cb('hi\n❯ ')),
+      vi.waitUntil(() => box.cb).then(() => box.cb(doneChunk('hi'))),
     ])
     expect(writeSpy).toHaveBeenCalledWith('hello\r')
   })
@@ -59,7 +63,7 @@ describe('POST /v1/chat/completions', () => {
     })
     await Promise.all([
       reqPromise,
-      vi.waitUntil(() => box.cb).then(() => box.cb('ok\n❯ ')),
+      vi.waitUntil(() => box.cb).then(() => box.cb(doneChunk('ok'))),
     ])
     expect(disposeSpy).toHaveBeenCalledTimes(1)
   })
@@ -112,7 +116,7 @@ describe('POST /v1/chat/completions', () => {
     })
     expect(second.status).toBe(503)
     expect(second.body.error.type).toBe('session_busy')
-    box.cb('ok\n❯ ')
+    box.cb(doneChunk('ok'))
     await first
   })
 
@@ -124,7 +128,7 @@ describe('POST /v1/chat/completions', () => {
     })
     await Promise.all([
       first,
-      vi.waitUntil(() => box.cb).then(() => box.cb('ok\n❯ ')),
+      vi.waitUntil(() => box.cb).then(() => box.cb(doneChunk('ok'))),
     ])
     const res = await request(app).post('/v1/chat/completions').send({
       sessionId: 's1', projectPath: '/b', messages: [{ role: 'user', content: 'hi' }],
@@ -153,7 +157,7 @@ describe('POST /v1/chat/completions', () => {
     })
     const [res] = await Promise.all([
       retry,
-      vi.waitUntil(() => box.cb, { timeout: 2000 }).then(() => box.cb('Hi again!\n❯ ')),
+      vi.waitUntil(() => box.cb, { timeout: 2000 }).then(() => box.cb(doneChunk('Hi again!'))),
     ])
     expect(res.status).toBe(200)
     expect(res.body.choices[0].message.content).toBe('Hi again!')
