@@ -1,9 +1,14 @@
 import { describe, it, expect, vi } from 'vitest'
+import http from 'node:http'
 import express from 'express'
 import request from 'supertest'
 import { createChatCompletionsRouter } from '../src/routes/chatCompletions.js'
 import { createTurnSessions } from '../src/turnSessions.js'
 
+// kill() here is a plain spy, not an auto-reject: a real killed process
+// takes a moment to actually exit, and tests that care about that gap
+// (the session lock isn't released until the raw promise settles) drive
+// `reject` themselves to simulate the process's own 'close' event firing.
 function fakeRunner() {
   const pending = []
   return {
@@ -14,11 +19,23 @@ function fakeRunner() {
         resolve = res
         reject = rej
       })
-      const kill = vi.fn(() => reject(new Error('killed')))
-      pending.push({ opts, resolve, reject, kill })
-      return { promise, kill }
+      const kill = vi.fn()
+      const claudeSessionId = opts.claudeSessionId ?? 'generated-uuid'
+      pending.push({ opts, resolve, reject, kill, claudeSessionId })
+      return { promise, kill, claudeSessionId }
     },
   }
+}
+
+async function flushMicrotasks() {
+  await new Promise((resolve) => setTimeout(resolve, 0))
+}
+
+function parseSseEvents(text) {
+  return text
+    .split('\n\n')
+    .filter((line) => line.startsWith('data: '))
+    .map((line) => line.slice('data: '.length))
 }
 
 function outcome(overrides = {}) {
@@ -133,7 +150,69 @@ describe('POST /v1/chat/completions', () => {
       sessionId: 's1', projectPath: '/app/workspace/proj', messages: [],
     })
     expect(res.status).toBe(400)
-    expect(res.body.error.type).toBe('invalid_request')
+    expect(res.body.error.type).toBe('invalid_request_error')
+    expect(res.headers['x-should-retry']).toBe('false')
+  })
+
+  it('returns 400 for a last message with empty string content', async () => {
+    const runner = fakeRunner()
+    const { app } = appWith(runner)
+    const res = await request(app).post('/v1/chat/completions').send({
+      sessionId: 's1', projectPath: '/app/workspace/proj', messages: [{ role: 'user', content: '' }],
+    })
+    expect(res.status).toBe(400)
+    expect(res.body.error.type).toBe('invalid_request_error')
+  })
+
+  it('flattens an OpenAI-style content-part array into plain text', async () => {
+    const runner = fakeRunner()
+    const { app } = appWith(runner)
+    const reqPromise = request(app).post('/v1/chat/completions').send({
+      sessionId: 's1', projectPath: '/app/workspace/proj',
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hello ' }, { type: 'text', text: 'world' }] }],
+    })
+    reqPromise.catch(() => {})
+    await waitForPending(runner)
+    runner.pending[0].resolve(outcome())
+    await reqPromise
+    expect(runner.pending[0].opts.content).toBe('hello world')
+  })
+
+  it('rejects a model value with characters outside a safe alias charset', async () => {
+    const runner = fakeRunner()
+    const { app } = appWith(runner)
+    const res = await request(app).post('/v1/chat/completions').send({
+      sessionId: 's1', projectPath: '/app/workspace/proj', model: 'opus; rm -rf /',
+      messages: [{ role: 'user', content: 'hi' }],
+    })
+    expect(res.status).toBe(400)
+    expect(res.body.error.type).toBe('invalid_request_error')
+  })
+
+  it('rejects a system message containing a NUL byte', async () => {
+    const runner = fakeRunner()
+    const { app } = appWith(runner)
+    const res = await request(app).post('/v1/chat/completions').send({
+      sessionId: 's1', projectPath: '/app/workspace/proj',
+      messages: [{ role: 'system', content: 'be\u0000 terse' }, { role: 'user', content: 'hi' }],
+    })
+    expect(res.status).toBe(400)
+    expect(res.body.error.type).toBe('invalid_request_error')
+  })
+
+  it('treats stream as streaming only when it is exactly boolean true', async () => {
+    const runner = fakeRunner()
+    const { app } = appWith(runner)
+    const reqPromise = request(app).post('/v1/chat/completions').send({
+      sessionId: 's1', projectPath: '/app/workspace/proj', stream: 'true',
+      messages: [{ role: 'user', content: 'hi' }],
+    })
+    reqPromise.catch(() => {})
+    await waitForPending(runner)
+    runner.pending[0].resolve(outcome())
+    const res = await reqPromise
+    expect(res.headers['content-type']).toMatch(/json/)
+    expect(res.body.object).toBe('chat.completion')
   })
 
   it('returns 400 for a relative or missing projectPath instead of crashing', async () => {
@@ -144,6 +223,7 @@ describe('POST /v1/chat/completions', () => {
     })
     expect(res.status).toBe(400)
     expect(res.body.error.type).toBe('invalid_project_path')
+    expect(res.headers['x-should-retry']).toBe('false')
   })
 
   it('returns 409 when sessionId is reused with a different projectPath', async () => {
@@ -162,9 +242,10 @@ describe('POST /v1/chat/completions', () => {
     })
     expect(res.status).toBe(409)
     expect(res.body.error.type).toBe('session_conflict')
+    expect(res.headers['x-should-retry']).toBe('false')
   })
 
-  it('returns 503 when a second request for the same session arrives while a turn is in flight', async () => {
+  it('returns 503 with a Retry-After header when a second request for the same session arrives while a turn is in flight', async () => {
     const runner = fakeRunner()
     const { app } = appWith(runner)
     const first = request(app).post('/v1/chat/completions').send({
@@ -177,8 +258,24 @@ describe('POST /v1/chat/completions', () => {
     })
     expect(second.status).toBe(503)
     expect(second.body.error.type).toBe('session_busy')
+    expect(second.headers['retry-after']).toBeDefined()
     runner.pending[0].resolve(outcome())
     await first
+  })
+
+  it('returns 500 server_error with the real error message when the runner rejects unexpectedly', async () => {
+    const runner = fakeRunner()
+    const { app } = appWith(runner)
+    const reqPromise = request(app).post('/v1/chat/completions').send({
+      sessionId: 's1', projectPath: '/app/workspace/proj', messages: [{ role: 'user', content: 'hi' }],
+    })
+    reqPromise.catch(() => {})
+    await waitForPending(runner)
+    runner.pending[0].reject(new Error('claude CLI exited with code 127: command not found'))
+    const res = await reqPromise
+    expect(res.status).toBe(500)
+    expect(res.body.error.type).toBe('server_error')
+    expect(res.body.error.message).toMatch(/exited with code 127/)
   })
 
   it('returns 500 with type assistant_error when the turn itself reports an error', async () => {
@@ -193,16 +290,23 @@ describe('POST /v1/chat/completions', () => {
     const res = await reqPromise
     expect(res.status).toBe(500)
     expect(res.body.error.type).toBe('assistant_error')
+    expect(res.headers['x-should-retry']).toBe('false')
   })
 
-  it('returns 504 and kills the runner after a timeout, leaving the session usable again', async () => {
+  it('returns 504 and kills the runner after a timeout; the session is usable again once the kill actually completes', async () => {
     const runner = fakeRunner()
     const { app } = appWith(runner, { timeoutMs: 50 })
     const res = await request(app).post('/v1/chat/completions').send({
       sessionId: 's1', projectPath: '/app/workspace/proj', messages: [{ role: 'user', content: 'hi' }],
     })
     expect(res.status).toBe(504)
+    expect(res.headers['x-should-retry']).toBeUndefined()
     expect(runner.pending[0].kill).toHaveBeenCalled()
+
+    // The killed process's own 'close' event firing — simulated here —
+    // is what actually settles the raw promise and releases the lock.
+    runner.pending[0].reject(new Error('process killed'))
+    await flushMicrotasks()
 
     const retry = request(app).post('/v1/chat/completions').send({
       sessionId: 's1', projectPath: '/app/workspace/proj', messages: [{ role: 'user', content: 'hi again' }],
@@ -212,6 +316,33 @@ describe('POST /v1/chat/completions', () => {
     runner.pending[1].resolve(outcome())
     const retryRes = await retry
     expect(retryRes.status).toBe(200)
+  })
+
+  it('keeps the session locked until the killed process actually exits, even though the client already got a 504', async () => {
+    const runner = fakeRunner()
+    const { app } = appWith(runner, { timeoutMs: 50 })
+    const res = await request(app).post('/v1/chat/completions').send({
+      sessionId: 's1', projectPath: '/app/workspace/proj', messages: [{ role: 'user', content: 'hi' }],
+    })
+    expect(res.status).toBe(504)
+
+    // A retry sent before the underlying process has actually exited must
+    // not be allowed to --resume the same CLI session concurrently.
+    const tooSoon = await request(app).post('/v1/chat/completions').send({
+      sessionId: 's1', projectPath: '/app/workspace/proj', messages: [{ role: 'user', content: 'too soon' }],
+    })
+    expect(tooSoon.status).toBe(503)
+
+    runner.pending[0].reject(new Error('process killed'))
+    await flushMicrotasks()
+
+    const afterExit = request(app).post('/v1/chat/completions').send({
+      sessionId: 's1', projectPath: '/app/workspace/proj', messages: [{ role: 'user', content: 'now' }],
+    })
+    afterExit.catch(() => {})
+    await waitForPending(runner, 2)
+    runner.pending[1].resolve(outcome())
+    expect((await afterExit).status).toBe(200)
   })
 
   describe('stream: true', () => {
@@ -270,6 +401,24 @@ describe('POST /v1/chat/completions', () => {
       expect(usageChunk.choices).toEqual([])
     })
 
+    it('includes an explicit zeroed usage chunk when include_usage is true but the runner reports no usage', async () => {
+      const runner = fakeRunner()
+      const { app } = appWith(runner)
+      const reqPromise = request(app).post('/v1/chat/completions').send({
+        sessionId: 's1', projectPath: '/app/workspace/proj', stream: true,
+        stream_options: { include_usage: true },
+        messages: [{ role: 'user', content: 'hello' }],
+      })
+      reqPromise.catch(() => {})
+      await waitForPending(runner)
+      runner.pending[0].resolve(outcome({ usage: null }))
+      const res = await reqPromise
+
+      const chunks = parseSseEvents(res.text).filter((l) => l !== '[DONE]').map((l) => JSON.parse(l))
+      const usageChunk = chunks.find((c) => 'usage' in c)
+      expect(usageChunk.usage).toEqual({ prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 })
+    })
+
     it('still returns a plain JSON 400 for an invalid streaming request', async () => {
       const runner = fakeRunner()
       const { app } = appWith(runner)
@@ -278,7 +427,72 @@ describe('POST /v1/chat/completions', () => {
       })
       expect(res.status).toBe(400)
       expect(res.headers['content-type']).toMatch(/json/)
-      expect(res.body.error.type).toBe('invalid_request')
+      expect(res.body.error.type).toBe('invalid_request_error')
+    })
+
+    it('writes an error chunk before [DONE] when the turn times out mid-stream', async () => {
+      const runner = fakeRunner()
+      const { app } = appWith(runner, { timeoutMs: 50 })
+      const res = await request(app).post('/v1/chat/completions').send({
+        sessionId: 's1', projectPath: '/app/workspace/proj', stream: true,
+        messages: [{ role: 'user', content: 'hello' }],
+      })
+
+      expect(res.headers['content-type']).toMatch(/text\/event-stream/)
+      const events = parseSseEvents(res.text)
+      expect(events[events.length - 1]).toBe('[DONE]')
+      const errorChunk = events.slice(0, -1).map((e) => JSON.parse(e)).find((c) => c.error)
+      expect(errorChunk.error.type).toBe('timeout')
+      runner.pending[0].reject(new Error('process killed'))
+    })
+
+    it('writes an error chunk before [DONE] when the result reports isError, instead of a stop finish_reason', async () => {
+      const runner = fakeRunner()
+      const { app } = appWith(runner)
+      const reqPromise = request(app).post('/v1/chat/completions').send({
+        sessionId: 's1', projectPath: '/app/workspace/proj', stream: true,
+        messages: [{ role: 'user', content: 'hello' }],
+      })
+      reqPromise.catch(() => {})
+      await waitForPending(runner)
+      runner.pending[0].resolve(outcome({ isError: true, subtype: 'error_during_execution', text: 'boom' }))
+      const res = await reqPromise
+
+      const events = parseSseEvents(res.text)
+      expect(events[events.length - 1]).toBe('[DONE]')
+      const chunks = events.slice(0, -1).map((e) => JSON.parse(e))
+      const errorChunk = chunks.find((c) => c.error)
+      expect(errorChunk.error.type).toBe('assistant_error')
+      expect(chunks.some((c) => c.choices?.[0]?.finish_reason === 'stop')).toBe(false)
+    })
+  })
+
+  describe('client disconnect', () => {
+    it('kills the runner when the client aborts a non-streaming request before it completes', async () => {
+      const runner = fakeRunner()
+      const { app } = appWith(runner)
+      const httpServer = http.createServer(app)
+      await new Promise((resolve) => httpServer.listen(0, '127.0.0.1', resolve))
+      const { port } = httpServer.address()
+
+      try {
+        const body = JSON.stringify({
+          sessionId: 's1', projectPath: '/app/workspace/proj', messages: [{ role: 'user', content: 'hi' }],
+        })
+        const req = http.request({
+          host: '127.0.0.1', port, path: '/v1/chat/completions', method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+        })
+        req.on('error', () => {})
+        req.end(body)
+
+        await waitForPending(runner)
+        req.destroy()
+        await vi.waitUntil(() => runner.pending[0].kill.mock.calls.length > 0, { timeout: 2000 })
+        expect(runner.pending[0].kill).toHaveBeenCalled()
+      } finally {
+        httpServer.close()
+      }
     })
   })
 })

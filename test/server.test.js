@@ -34,7 +34,7 @@ describe('createServer', () => {
       const { app } = createServer({ port: 0, host: '127.0.0.1', execTimeoutMs: 1000 }, vi.fn())
       const res = await request(app).post('/api/sessions').send({ projectPath: '/app/workspace/proj' })
       expect(res.status).toBe(400)
-      expect(res.body.error.type).toBe('invalid_request')
+      expect(res.body.error.type).toBe('invalid_request_error')
     })
 
     it('returns 400 for an invalid projectPath', async () => {

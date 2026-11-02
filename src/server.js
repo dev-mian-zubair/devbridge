@@ -78,7 +78,7 @@ export function createApp(sessionManager, turnSessions, runner, { timeoutMs = 12
   app.post('/api/sessions', async (req, res) => {
     const { sessionId, projectPath } = req.body ?? {}
     if (typeof sessionId !== 'string' || sessionId.length === 0) {
-      return res.status(400).json({ error: { message: 'sessionId is required', type: 'invalid_request' } })
+      return res.status(400).json({ error: { message: 'sessionId is required', type: 'invalid_request_error' } })
     }
     try {
       await sessionManager.getOrCreate(sessionId, projectPath)
@@ -90,7 +90,7 @@ export function createApp(sessionManager, turnSessions, runner, { timeoutMs = 12
       if (err.name === 'InvalidProjectPathError') {
         return res.status(400).json({ error: { message: err.message, type: 'invalid_project_path' } })
       }
-      return res.status(500).json({ error: { message: 'internal error', type: 'internal' } })
+      return res.status(500).json({ error: { message: 'internal error', type: 'server_error' } })
     }
   })
 
