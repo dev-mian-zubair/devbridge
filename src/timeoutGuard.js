@@ -1,7 +1,7 @@
-export function withTimeout(promise, pty, timeoutMs) {
+export function withTimeout(promise, onTimeout, timeoutMs) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
-      pty.write('\x03')
+      onTimeout()
       reject(new Error('timeout'))
     }, timeoutMs)
 
