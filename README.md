@@ -11,10 +11,16 @@ Two independent execution paths share the CLI, each suited to what it does:
   non-interactive interface (`claude -p --output-format stream-json`), not a
   pseudo-terminal. This is the CLI's documented scriptable mode: it returns
   structured JSON events with real per-token streaming and exact token
-  usage, and `--permission-prompts none` guarantees a tool-approval prompt
-  is denied rather than hanging forever (there's no attached terminal to
-  approve it in this mode). Multi-turn continuity uses the CLI's own
-  `--session-id`/`--resume`, not a long-lived process.
+  usage. `--permission-prompts none` turns any prompt that would otherwise
+  block on a live human into a denial instead of a hang (there's no attached
+  terminal to approve it in this mode) — it does not change what the
+  permission *mode* itself allows: a tool already allow-listed by your own
+  Claude Code settings (`~/.claude/settings.json`, a project's
+  `.claude/settings.json`) still runs unattended here exactly as it would in
+  an interactive session, and a stuck tool invocation (not a permission
+  prompt) is only bounded by `EXEC_TIMEOUT_MS`, same as anything else.
+  Multi-turn continuity uses the CLI's own `--session-id`/`--resume`, not a
+  long-lived process.
 - **The dashboard's debug terminal** (`WS /api/session/stream`) still drives
   a real interactive session through `node-pty`, because that's genuinely a
   different job: a human watching and typing into the actual CLI UI. It's
@@ -101,8 +107,12 @@ curl http://127.0.0.1:3000/v1/chat/completions \
   paired with the same `projectPath` (409 `session_conflict` otherwise).
   `projectPath` must be an absolute path mounted into the container.
 - `model` is optional and passed straight through to `--model` (accepts the
-  CLI's own aliases, e.g. `opus`/`sonnet`/`haiku`, or a full model name).
-  The response always reports the model that actually served the request.
+  CLI's own aliases, e.g. `opus`/`sonnet`/`haiku`, or a full model name),
+  restricted to a safe charset (letters, numbers, `. - _ :`). The
+  non-streaming response always reports the model that actually served the
+  request; in a streaming response only the *last* chunk does — the first
+  (role) chunk is sent immediately, before the CLI has reported which model
+  picked up the turn, so it echoes back whatever alias you requested.
 - Any `role: "system"` messages are joined and sent as `--append-system-prompt`.
   Only the *last* message's `content` becomes the new turn's prompt — earlier
   `user`/`assistant` messages aren't replayed, because the CLI session itself
@@ -124,6 +134,25 @@ curl http://127.0.0.1:3000/v1/chat/completions \
   "type": "timeout" } }` and the CLI process is killed.
 - `GET /v1/models` lists the model aliases the CLI itself exposes
   (`--model <alias>`), for clients that probe this before use.
+- Error responses use OpenAI's generic type names where one exists
+  (`invalid_request_error`, `server_error`) and proxy-specific ones where it
+  doesn't (`invalid_project_path`, `session_conflict`, `session_busy`,
+  `timeout`, `assistant_error`). `invalid_request_error`, `invalid_project_path`,
+  `session_conflict`, and `assistant_error` responses set
+  `x-should-retry: false`; `session_busy` sets `Retry-After`.
+
+### Known limitations
+
+- The `sessionId -> claudeSessionId` mapping lives in memory only. Restart
+  the container (or crash before a session's very first turn completes) and
+  that `sessionId` starts a brand-new CLI conversation on its next request —
+  this is a deliberate choice over optimistically guessing at a CLI session
+  id that might not actually exist yet to `--resume`, which would turn a
+  recoverable "starts fresh" outcome into a permanent "every future request
+  for this sessionId fails" one.
+- A long-running turn that's actively streaming is still bounded by the
+  same flat `EXEC_TIMEOUT_MS` as everything else, not an idle timer reset on
+  each token — a legitimately long agentic turn can hit it.
 
 ### `WS /api/session/stream`
 

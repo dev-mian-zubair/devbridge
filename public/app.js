@@ -50,27 +50,40 @@ function renderSessionList() {
 // sessionId, and vice versa.
 async function ensureBackendSession(sessionId, projectPath) {
   try {
-    await fetch('/api/sessions', {
+    const res = await fetch('/api/sessions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ sessionId, projectPath }),
     })
+    if (!res.ok) {
+      const body = await res.json().catch(() => null)
+      return { ok: false, message: body?.error?.message ?? `request failed (${res.status})` }
+    }
+    return { ok: true }
   } catch (err) {
-    console.error('Failed to create session', sessionId, err)
+    return { ok: false, message: err.message }
   }
 }
 
-addSessionForm.addEventListener('submit', (event) => {
+addSessionForm.addEventListener('submit', async (event) => {
   event.preventDefault()
   const sessionId = sessionIdInput.value.trim()
   const projectPath = projectPathInput.value.trim()
   if (!sessionId || !projectPath) return
+  sessionIdInput.value = ''
+  projectPathInput.value = ''
+
+  // The debug terminal has nothing to attach to until the backend PTY
+  // session actually exists, so wait for that before selecting it (or
+  // showing it in the list at all, if it was rejected).
+  const result = await ensureBackendSession(sessionId, projectPath)
+  if (!result.ok) {
+    setStatus(`failed to add session: ${result.message}`)
+    return
+  }
   sessions.set(sessionId, { projectPath })
   renderSessionList()
   selectSession(sessionId)
-  ensureBackendSession(sessionId, projectPath)
-  sessionIdInput.value = ''
-  projectPathInput.value = ''
 })
 
 authButton.addEventListener('click', () => {
