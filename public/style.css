@@ -1,0 +1,89 @@
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: system-ui, sans-serif;
+  background: #1e1e1e;
+  color: #ddd;
+}
+
+.status-bar {
+  padding: 0.5rem 1rem;
+  background: #252526;
+  border-bottom: 1px solid #333;
+  font-weight: 600;
+}
+
+.layout {
+  display: flex;
+  height: calc(100vh - 2.5rem);
+}
+
+.navigator {
+  width: 260px;
+  padding: 1rem;
+  background: #252526;
+  border-right: 1px solid #333;
+  overflow-y: auto;
+}
+
+.navigator h2 {
+  margin-top: 0;
+  font-size: 0.9rem;
+  text-transform: uppercase;
+  color: #999;
+}
+
+#session-list {
+  list-style: none;
+  padding: 0;
+  margin: 0 0 1rem;
+}
+
+#session-list li {
+  padding: 0.4rem 0.5rem;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+#session-list li:hover {
+  background: #37373d;
+}
+
+#add-session-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  margin-bottom: 1rem;
+}
+
+#add-session-form input,
+#add-session-form button,
+#auth-button {
+  padding: 0.4rem;
+  border-radius: 4px;
+  border: 1px solid #444;
+  background: #3c3c3c;
+  color: #ddd;
+}
+
+#auth-link {
+  margin-top: 0.5rem;
+  word-break: break-all;
+}
+
+#auth-link a {
+  color: #4daafc;
+}
+
+main {
+  flex: 1;
+  padding: 1rem;
+  overflow: hidden;
+}
+
+#terminal {
+  height: 100%;
+}
