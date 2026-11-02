@@ -1,4 +1,5 @@
 import path from 'node:path'
+import fs from 'node:fs'
 
 export { SessionConflictError, InvalidProjectPathError } from './sessionErrors.js'
 import { SessionConflictError, InvalidProjectPathError } from './sessionErrors.js'
@@ -45,7 +46,10 @@ function waitForReadiness(pty, { timeoutMs, settleMs }) {
   })
 }
 
-export function createSessionManager(spawnFn, { readinessTimeoutMs = 50, readinessSettleMs = 10 } = {}) {
+export function createSessionManager(
+  spawnFn,
+  { readinessTimeoutMs = 50, readinessSettleMs = 10, statFn = fs.statSync } = {}
+) {
   const sessions = new Map()
 
   return {
@@ -59,6 +63,16 @@ export function createSessionManager(spawnFn, { readinessTimeoutMs = 50, readine
       }
 
       if (typeof projectPath !== 'string' || projectPath.length === 0 || !path.isAbsolute(projectPath)) {
+        throw new InvalidProjectPathError(projectPath)
+      }
+
+      let stat
+      try {
+        stat = statFn(projectPath)
+      } catch {
+        throw new InvalidProjectPathError(projectPath)
+      }
+      if (!stat.isDirectory()) {
         throw new InvalidProjectPathError(projectPath)
       }
 

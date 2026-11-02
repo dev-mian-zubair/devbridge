@@ -35,7 +35,7 @@ function outcome(overrides = {}) {
   }
 }
 
-function appWith(runner, { timeoutMs = 1000, sessions = createTurnSessions() } = {}) {
+function appWith(runner, { timeoutMs = 1000, sessions = createTurnSessions(() => ({ isDirectory: () => true })) } = {}) {
   const app = express()
   app.use(express.json())
   app.use(createChatCompletionsRouter({ sessions, runner, timeoutMs }))

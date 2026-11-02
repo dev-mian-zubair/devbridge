@@ -1,4 +1,5 @@
 import path from 'node:path'
+import fs from 'node:fs'
 import { SessionConflictError, InvalidProjectPathError } from './sessionErrors.js'
 
 export { SessionConflictError, InvalidProjectPathError }
@@ -8,7 +9,7 @@ export { SessionConflictError, InvalidProjectPathError }
 // and continuity across turns comes from the CLI's own --resume, keyed on
 // the claudeSessionId it hands back. This store only remembers that mapping
 // and which projectPath a given API sessionId is bound to.
-export function createTurnSessions() {
+export function createTurnSessions(statFn = fs.statSync) {
   const sessions = new Map()
 
   return {
@@ -25,6 +26,19 @@ export function createTurnSessions() {
       }
 
       if (typeof projectPath !== 'string' || projectPath.length === 0 || !path.isAbsolute(projectPath)) {
+        throw new InvalidProjectPathError(projectPath)
+      }
+
+      // A path that doesn't exist (or isn't a directory) would otherwise
+      // surface as an opaque spawn ENOENT, indistinguishable from the
+      // `claude` binary itself being missing.
+      let stat
+      try {
+        stat = statFn(projectPath)
+      } catch {
+        throw new InvalidProjectPathError(projectPath)
+      }
+      if (!stat.isDirectory()) {
         throw new InvalidProjectPathError(projectPath)
       }
 

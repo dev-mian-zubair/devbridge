@@ -25,7 +25,7 @@ describe('createServer', () => {
       const pty = { write: vi.fn(), onData: vi.fn(), onExit: vi.fn(), kill: vi.fn() }
       const spawnFn = vi.fn(() => pty)
       const { app } = createServer({ port: 0, host: '127.0.0.1', execTimeoutMs: 1000 }, spawnFn)
-      const res = await request(app).post('/api/sessions').send({ sessionId: 's1', projectPath: '/app/workspace/proj' })
+      const res = await request(app).post('/api/sessions').send({ sessionId: 's1', projectPath: process.cwd() })
       expect(res.status).toBe(204)
       expect(spawnFn).toHaveBeenCalledTimes(1)
     })
@@ -48,7 +48,7 @@ describe('createServer', () => {
       const pty = { write: vi.fn(), onData: vi.fn(), onExit: vi.fn(), kill: vi.fn() }
       const spawnFn = vi.fn(() => pty)
       const { app } = createServer({ port: 0, host: '127.0.0.1', execTimeoutMs: 1000 }, spawnFn)
-      await request(app).post('/api/sessions').send({ sessionId: 's1', projectPath: '/a' })
+      await request(app).post('/api/sessions').send({ sessionId: 's1', projectPath: process.cwd() })
       const res = await request(app).post('/api/sessions').send({ sessionId: 's1', projectPath: '/b' })
       expect(res.status).toBe(409)
       expect(res.body.error.type).toBe('session_conflict')
