@@ -4,24 +4,36 @@ import { createSessionManager } from '../src/sessionManager.js'
 
 function fakeWs() { return { send: vi.fn(), on: vi.fn() } }
 
-function fakePtyFactory(disposeSpy) {
+// getOrCreate() now does its own internal onData() registration (the
+// readiness wait) before resolving, separate from any listener the WS
+// handler itself registers afterward — each onData() call here gets its
+// own disposable so a test can target the specific registration it cares
+// about via lastDisposeSpy(), not conflate it with the readiness one.
+function fakePtyFactory() {
   let dataCb
+  const disposeSpies = []
   return {
     spawnFn: vi.fn(() => ({
       write: vi.fn(),
-      onData: (cb) => { dataCb = cb; return { dispose: disposeSpy } },
+      onData: (cb) => {
+        dataCb = cb
+        const spy = vi.fn()
+        disposeSpies.push(spy)
+        return { dispose: spy }
+      },
       onExit: vi.fn(),
       kill: vi.fn(),
     })),
     trigger: (chunk) => dataCb(chunk),
+    lastDisposeSpy: () => disposeSpies[disposeSpies.length - 1],
   }
 }
 
 describe('createSessionStreamHandler', () => {
-  it('writes inbound input data to the matching session PTY', () => {
-    const { spawnFn } = fakePtyFactory(vi.fn())
+  it('writes inbound input data to the matching session PTY', async () => {
+    const { spawnFn } = fakePtyFactory()
     const sessionManager = createSessionManager(spawnFn)
-    const session = sessionManager.getOrCreate('s1', '/app/workspace/proj')
+    const session = await sessionManager.getOrCreate('s1', '/app/workspace/proj')
     const ws = fakeWs()
     const handler = createSessionStreamHandler(sessionManager)
     handler(ws, {})
@@ -30,10 +42,10 @@ describe('createSessionStreamHandler', () => {
     expect(session.pty.write).toHaveBeenCalledWith('/login\n')
   })
 
-  it('forwards PTY output as an outbound output frame', () => {
-    const { spawnFn, trigger } = fakePtyFactory(vi.fn())
+  it('forwards PTY output as an outbound output frame', async () => {
+    const { spawnFn, trigger } = fakePtyFactory()
     const sessionManager = createSessionManager(spawnFn)
-    sessionManager.getOrCreate('s1', '/app/workspace/proj')
+    await sessionManager.getOrCreate('s1', '/app/workspace/proj')
     const ws = fakeWs()
     const handler = createSessionStreamHandler(sessionManager)
     handler(ws, {})
@@ -63,10 +75,10 @@ describe('createSessionStreamHandler', () => {
     expect(ws.send).toHaveBeenCalledWith(JSON.stringify({ type: 'error', sessionId: null, data: 'invalid frame' }))
   })
 
-  it('sends an error frame for a frame with a non-string data field instead of throwing', () => {
-    const { spawnFn } = fakePtyFactory(vi.fn())
+  it('sends an error frame for a frame with a non-string data field instead of throwing', async () => {
+    const { spawnFn } = fakePtyFactory()
     const sessionManager = createSessionManager(spawnFn)
-    sessionManager.getOrCreate('s1', '/app/workspace/proj')
+    await sessionManager.getOrCreate('s1', '/app/workspace/proj')
     const ws = fakeWs()
     const handler = createSessionStreamHandler(sessionManager)
     handler(ws, {})
@@ -75,18 +87,18 @@ describe('createSessionStreamHandler', () => {
     expect(ws.send).toHaveBeenCalledWith(JSON.stringify({ type: 'error', sessionId: 's1', data: 'invalid frame' }))
   })
 
-  it('disposes all subscribed PTY data listeners when the socket closes', () => {
-    const disposeSpy = vi.fn()
-    const { spawnFn } = fakePtyFactory(disposeSpy)
+  it('disposes all subscribed PTY data listeners when the socket closes', async () => {
+    const { spawnFn, lastDisposeSpy } = fakePtyFactory()
     const sessionManager = createSessionManager(spawnFn)
-    sessionManager.getOrCreate('s1', '/app/workspace/proj')
+    await sessionManager.getOrCreate('s1', '/app/workspace/proj')
     const ws = fakeWs()
     const handler = createSessionStreamHandler(sessionManager)
     handler(ws, {})
     const onMessage = ws.on.mock.calls.find(([event]) => event === 'message')[1]
     onMessage(JSON.stringify({ type: 'input', sessionId: 's1', data: 'x' }))
+    const wsListenerDisposeSpy = lastDisposeSpy()
     const onClose = ws.on.mock.calls.find(([event]) => event === 'close')[1]
     onClose()
-    expect(disposeSpy).toHaveBeenCalledTimes(1)
+    expect(wsListenerDisposeSpy).toHaveBeenCalledTimes(1)
   })
 })

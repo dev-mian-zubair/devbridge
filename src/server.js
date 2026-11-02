@@ -72,7 +72,10 @@ export function createApp(sessionManager, { timeoutMs = 120000 } = {}) {
 }
 
 export function createServer(config, spawnFn) {
-  const sessionManager = createSessionManager(spawnFn)
+  const sessionManager = createSessionManager(spawnFn, {
+    readinessTimeoutMs: config.readinessTimeoutMs,
+    readinessSettleMs: config.readinessSettleMs,
+  })
   const app = createApp(sessionManager, { timeoutMs: config.execTimeoutMs })
   const httpServer = http.createServer(app)
   const wss = new WebSocketServer({

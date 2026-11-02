@@ -55,7 +55,7 @@ export function createChatCompletionsRouter(sessionManager, { timeoutMs }) {
 
     let session
     try {
-      session = sessionManager.getOrCreate(sessionId, projectPath)
+      session = await sessionManager.getOrCreate(sessionId, projectPath)
     } catch (err) {
       if (err instanceof SessionConflictError) {
         return res.status(409).json({ error: { message: err.message, type: 'session_conflict' } })

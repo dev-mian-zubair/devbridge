@@ -4,12 +4,29 @@ import { loadConfig } from '../src/config.js'
 describe('loadConfig', () => {
   it('applies defaults when env vars are absent', () => {
     const cfg = loadConfig({})
-    expect(cfg).toEqual({ port: 3000, host: '127.0.0.1', claudeConfigDir: '/data/.claude', execTimeoutMs: 120000 })
+    expect(cfg).toEqual({
+      port: 3000,
+      host: '127.0.0.1',
+      claudeConfigDir: '/data/.claude',
+      execTimeoutMs: 120000,
+      readinessTimeoutMs: 5000,
+      readinessSettleMs: 250,
+    })
   })
 
   it('overrides defaults from the given env object', () => {
-    const cfg = loadConfig({ PORT: '4000', HOST: '0.0.0.0', CLAUDE_CONFIG_DIR: '/x', EXEC_TIMEOUT_MS: '5000' })
-    expect(cfg).toEqual({ port: 4000, host: '0.0.0.0', claudeConfigDir: '/x', execTimeoutMs: 5000 })
+    const cfg = loadConfig({
+      PORT: '4000', HOST: '0.0.0.0', CLAUDE_CONFIG_DIR: '/x', EXEC_TIMEOUT_MS: '5000',
+      READINESS_TIMEOUT_MS: '9000', READINESS_SETTLE_MS: '400',
+    })
+    expect(cfg).toEqual({
+      port: 4000,
+      host: '0.0.0.0',
+      claudeConfigDir: '/x',
+      execTimeoutMs: 5000,
+      readinessTimeoutMs: 9000,
+      readinessSettleMs: 400,
+    })
   })
 
   it('falls back to defaults when numeric env vars are not valid numbers', () => {
