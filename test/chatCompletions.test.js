@@ -2,108 +2,133 @@ import { describe, it, expect, vi } from 'vitest'
 import express from 'express'
 import request from 'supertest'
 import { createChatCompletionsRouter } from '../src/routes/chatCompletions.js'
-import { createSessionManager } from '../src/sessionManager.js'
+import { createTurnSessions } from '../src/turnSessions.js'
 
-function doneChunk(reply) {
-  return `● ${reply}\r\n✻ Brewed for 1s · done 6:15 PM\r\n`
+function fakeRunner() {
+  const pending = []
+  return {
+    pending,
+    runTurn(opts) {
+      let resolve, reject
+      const promise = new Promise((res, rej) => {
+        resolve = res
+        reject = rej
+      })
+      const kill = vi.fn(() => reject(new Error('killed')))
+      pending.push({ opts, resolve, reject, kill })
+      return { promise, kill }
+    },
+  }
 }
 
-// Each request against a brand-new session now triggers TWO sequential
-// pty.onData() registrations: sessionManager's internal readiness-wait
-// listener (registered first, resolves on its own small fallback timeout
-// since this fake never emits the real readiness marker), then
-// chatCompletions' own reply listener (registered once getOrCreate
-// resolves). `box.cb` always holds the latest registration; tests wait
-// for `box.registrations >= 2` so they interact with the reply listener,
-// not the readiness one. `disposeSpy` (returned here) tracks only the
-// reply listener's own disposable, not the readiness listener's.
-function appWithFakePty(onDataHandlerBox, { timeoutMs = 1000 } = {}) {
-  const writeSpy = vi.fn()
-  const replyDisposeSpy = vi.fn()
-  onDataHandlerBox.registrations = 0
-  const spawnFn = vi.fn(() => ({
-    write: writeSpy,
-    onData: (cb) => {
-      onDataHandlerBox.registrations += 1
-      onDataHandlerBox.cb = cb
-      const isReadinessListener = onDataHandlerBox.registrations === 1
-      return { dispose: isReadinessListener ? vi.fn() : replyDisposeSpy }
-    },
-    onExit: vi.fn(),
-    kill: vi.fn(),
-  }))
-  const sessionManager = createSessionManager(spawnFn)
+function outcome(overrides = {}) {
+  return {
+    text: 'Hi there!',
+    usage: { input_tokens: 2, cache_read_input_tokens: 10, cache_creation_input_tokens: 0, output_tokens: 4 },
+    totalCostUsd: 0.01,
+    claudeSessionId: 'claude-uuid-1',
+    isError: false,
+    stopReason: 'end_turn',
+    subtype: 'success',
+    model: 'claude-opus-5-5',
+    ...overrides,
+  }
+}
+
+function appWith(runner, { timeoutMs = 1000, sessions = createTurnSessions() } = {}) {
   const app = express()
   app.use(express.json())
-  app.use(createChatCompletionsRouter(sessionManager, { timeoutMs }))
-  return { app, disposeSpy: replyDisposeSpy, writeSpy }
+  app.use(createChatCompletionsRouter({ sessions, runner, timeoutMs }))
+  return { app, sessions }
 }
 
-function waitForReplyListener(box, opts) {
-  return vi.waitUntil(() => box.registrations >= 2, opts)
+async function waitForPending(runner, count = 1) {
+  await vi.waitUntil(() => runner.pending.length >= count, { timeout: 2000 })
 }
 
 describe('POST /v1/chat/completions', () => {
-  it('returns the detected reply once the PTY shows a prompt marker', async () => {
-    const box = {}
-    const { app } = appWithFakePty(box)
+  it('returns the reply, model, and finish_reason once the runner resolves', async () => {
+    const runner = fakeRunner()
+    const { app } = appWith(runner)
     const reqPromise = request(app).post('/v1/chat/completions').send({
-      model: 'claude-code-local', sessionId: 's1', projectPath: '/app/workspace/proj',
-      messages: [{ role: 'user', content: 'hello' }],
+      sessionId: 's1', projectPath: '/app/workspace/proj', messages: [{ role: 'user', content: 'hello' }],
     })
     const [res] = await Promise.all([
       reqPromise,
-      waitForReplyListener(box).then(() => box.cb(doneChunk('Hi there!'))),
+      waitForPending(runner).then(() => runner.pending[0].resolve(outcome())),
     ])
     expect(res.status).toBe(200)
-    expect(res.body.choices[0].message.content).toBe('Hi there!')
     expect(res.body.object).toBe('chat.completion')
+    expect(res.body.model).toBe('claude-opus-5-5')
+    expect(res.body.choices[0].message).toEqual({ role: 'assistant', content: 'Hi there!' })
+    expect(res.body.choices[0].finish_reason).toBe('stop')
   })
 
-  it('writes the message to the PTY terminated with \\r, the terminal Enter key, not \\n', async () => {
-    const box = {}
-    const { app, writeSpy } = appWithFakePty(box)
+  it('maps usage into prompt_tokens/completion_tokens/total_tokens', async () => {
+    const runner = fakeRunner()
+    const { app } = appWith(runner)
     const reqPromise = request(app).post('/v1/chat/completions').send({
-      sessionId: 's1', projectPath: '/app/workspace/proj',
-      messages: [{ role: 'user', content: 'hello' }],
+      sessionId: 's1', projectPath: '/app/workspace/proj', messages: [{ role: 'user', content: 'hello' }],
     })
-    await Promise.all([
+    const [res] = await Promise.all([
       reqPromise,
-      waitForReplyListener(box).then(() => box.cb(doneChunk('hi'))),
+      waitForPending(runner).then(() => runner.pending[0].resolve(outcome())),
     ])
-    expect(writeSpy).toHaveBeenCalledWith('hello\r')
+    expect(res.body.usage).toEqual({ prompt_tokens: 12, completion_tokens: 4, total_tokens: 16 })
   })
 
-  it('disposes the PTY data listener once a turn settles successfully', async () => {
-    const box = {}
-    const { app, disposeSpy } = appWithFakePty(box)
+  it('passes the last message content, projectPath, model, and systemPrompt to the runner', async () => {
+    const runner = fakeRunner()
+    const { app } = appWith(runner)
     const reqPromise = request(app).post('/v1/chat/completions').send({
-      sessionId: 's1', projectPath: '/app/workspace/proj', messages: [{ role: 'user', content: 'hi' }],
+      sessionId: 's1',
+      projectPath: '/app/workspace/proj',
+      model: 'opus',
+      messages: [
+        { role: 'system', content: 'Be terse.' },
+        { role: 'user', content: 'first' },
+        { role: 'assistant', content: 'ack' },
+        { role: 'user', content: 'hello' },
+      ],
     })
-    await Promise.all([
-      reqPromise,
-      waitForReplyListener(box).then(() => box.cb(doneChunk('ok'))),
-    ])
-    expect(disposeSpy).toHaveBeenCalledTimes(1)
+    reqPromise.catch(() => {})
+    await waitForPending(runner)
+    runner.pending[0].resolve(outcome())
+    await reqPromise
+
+    expect(runner.pending[0].opts.content).toBe('hello')
+    expect(runner.pending[0].opts.projectPath).toBe('/app/workspace/proj')
+    expect(runner.pending[0].opts.model).toBe('opus')
+    expect(runner.pending[0].opts.systemPrompt).toBe('Be terse.')
+    expect(runner.pending[0].opts.claudeSessionId).toBeUndefined()
   })
 
-  it('disposes the PTY data listener after a timeout', async () => {
-    // Fake timers interact badly with the readiness-wait's own setTimeout
-    // plus real socket I/O (request delivery itself needs the real event
-    // loop), so this uses a small real timeoutMs instead of faking time —
-    // same tradeoff already used successfully elsewhere in this suite.
-    const box = {}
-    const { app, disposeSpy } = appWithFakePty(box, { timeoutMs: 50 })
-    const req = request(app).post('/v1/chat/completions').send({
-      sessionId: 's1', projectPath: '/app/workspace/proj', messages: [{ role: 'user', content: 'hi' }],
+  it('resumes with the claudeSessionId stored from the previous turn', async () => {
+    const runner = fakeRunner()
+    const { app } = appWith(runner)
+
+    const first = request(app).post('/v1/chat/completions').send({
+      sessionId: 's1', projectPath: '/app/workspace/proj', messages: [{ role: 'user', content: 'hello' }],
     })
-    await req
-    expect(disposeSpy).toHaveBeenCalledTimes(1)
+    first.catch(() => {})
+    await waitForPending(runner, 1)
+    runner.pending[0].resolve(outcome({ claudeSessionId: 'claude-uuid-1' }))
+    await first
+
+    const second = request(app).post('/v1/chat/completions').send({
+      sessionId: 's1', projectPath: '/app/workspace/proj', messages: [{ role: 'user', content: 'again' }],
+    })
+    second.catch(() => {})
+    await waitForPending(runner, 2)
+    runner.pending[1].resolve(outcome({ claudeSessionId: 'claude-uuid-1' }))
+    await second
+
+    expect(runner.pending[1].opts.claudeSessionId).toBe('claude-uuid-1')
   })
 
   it('returns 400 for a request missing a non-empty messages array', async () => {
-    const box = {}
-    const { app } = appWithFakePty(box)
+    const runner = fakeRunner()
+    const { app } = appWith(runner)
     const res = await request(app).post('/v1/chat/completions').send({
       sessionId: 's1', projectPath: '/app/workspace/proj', messages: [],
     })
@@ -112,8 +137,8 @@ describe('POST /v1/chat/completions', () => {
   })
 
   it('returns 400 for a relative or missing projectPath instead of crashing', async () => {
-    const box = {}
-    const { app } = appWithFakePty(box)
+    const runner = fakeRunner()
+    const { app } = appWith(runner)
     const res = await request(app).post('/v1/chat/completions').send({
       sessionId: 's1', projectPath: 'relative/path', messages: [{ role: 'user', content: 'hi' }],
     })
@@ -121,33 +146,17 @@ describe('POST /v1/chat/completions', () => {
     expect(res.body.error.type).toBe('invalid_project_path')
   })
 
-  it('returns 503 when a second request for the same session arrives while a turn is in flight', async () => {
-    const box = {}
-    const { app } = appWithFakePty(box)
-    const first = request(app).post('/v1/chat/completions').send({
-      sessionId: 's1', projectPath: '/app/workspace/proj', messages: [{ role: 'user', content: 'hi' }],
-    })
-    first.catch(() => {})
-    await waitForReplyListener(box)
-    const second = await request(app).post('/v1/chat/completions').send({
-      sessionId: 's1', projectPath: '/app/workspace/proj', messages: [{ role: 'user', content: 'again' }],
-    })
-    expect(second.status).toBe(503)
-    expect(second.body.error.type).toBe('session_busy')
-    box.cb(doneChunk('ok'))
-    await first
-  })
-
   it('returns 409 when sessionId is reused with a different projectPath', async () => {
-    const box = {}
-    const { app } = appWithFakePty(box)
+    const runner = fakeRunner()
+    const { app } = appWith(runner)
     const first = request(app).post('/v1/chat/completions').send({
       sessionId: 's1', projectPath: '/a', messages: [{ role: 'user', content: 'hi' }],
     })
-    await Promise.all([
-      first,
-      waitForReplyListener(box).then(() => box.cb(doneChunk('ok'))),
-    ])
+    first.catch(() => {})
+    await waitForPending(runner)
+    runner.pending[0].resolve(outcome())
+    await first
+
     const res = await request(app).post('/v1/chat/completions').send({
       sessionId: 's1', projectPath: '/b', messages: [{ role: 'user', content: 'hi' }],
     })
@@ -155,29 +164,121 @@ describe('POST /v1/chat/completions', () => {
     expect(res.body.error.type).toBe('session_conflict')
   })
 
-  it('leaves the session usable for a later request after a timeout', async () => {
-    // Real (small) timeoutMs throughout — see the previous test's comment
-    // on why fake timers don't mix well with the readiness-wait step.
-    const box = {}
-    const { app } = appWithFakePty(box, { timeoutMs: 50 })
-    const timedOut = request(app).post('/v1/chat/completions').send({
+  it('returns 503 when a second request for the same session arrives while a turn is in flight', async () => {
+    const runner = fakeRunner()
+    const { app } = appWith(runner)
+    const first = request(app).post('/v1/chat/completions').send({
       sessionId: 's1', projectPath: '/app/workspace/proj', messages: [{ role: 'user', content: 'hi' }],
     })
-    const timeoutRes = await timedOut
-    expect(timeoutRes.status).toBe(504)
+    first.catch(() => {})
+    await waitForPending(runner)
+    const second = await request(app).post('/v1/chat/completions').send({
+      sessionId: 's1', projectPath: '/app/workspace/proj', messages: [{ role: 'user', content: 'again' }],
+    })
+    expect(second.status).toBe(503)
+    expect(second.body.error.type).toBe('session_busy')
+    runner.pending[0].resolve(outcome())
+    await first
+  })
 
-    // 's1' already exists now, so this retry reuses it: no readiness wait,
-    // just the one reply-listener registration.
-    box.registrations = 0
-    box.cb = undefined
+  it('returns 500 with type assistant_error when the turn itself reports an error', async () => {
+    const runner = fakeRunner()
+    const { app } = appWith(runner)
+    const reqPromise = request(app).post('/v1/chat/completions').send({
+      sessionId: 's1', projectPath: '/app/workspace/proj', messages: [{ role: 'user', content: 'hi' }],
+    })
+    reqPromise.catch(() => {})
+    await waitForPending(runner)
+    runner.pending[0].resolve(outcome({ isError: true, subtype: 'error_during_execution', text: 'boom' }))
+    const res = await reqPromise
+    expect(res.status).toBe(500)
+    expect(res.body.error.type).toBe('assistant_error')
+  })
+
+  it('returns 504 and kills the runner after a timeout, leaving the session usable again', async () => {
+    const runner = fakeRunner()
+    const { app } = appWith(runner, { timeoutMs: 50 })
+    const res = await request(app).post('/v1/chat/completions').send({
+      sessionId: 's1', projectPath: '/app/workspace/proj', messages: [{ role: 'user', content: 'hi' }],
+    })
+    expect(res.status).toBe(504)
+    expect(runner.pending[0].kill).toHaveBeenCalled()
+
     const retry = request(app).post('/v1/chat/completions').send({
       sessionId: 's1', projectPath: '/app/workspace/proj', messages: [{ role: 'user', content: 'hi again' }],
     })
-    const [res] = await Promise.all([
-      retry,
-      vi.waitUntil(() => box.registrations >= 1, { timeout: 2000 }).then(() => box.cb(doneChunk('Hi again!'))),
-    ])
-    expect(res.status).toBe(200)
-    expect(res.body.choices[0].message.content).toBe('Hi again!')
+    retry.catch(() => {})
+    await waitForPending(runner, 2)
+    runner.pending[1].resolve(outcome())
+    const retryRes = await retry
+    expect(retryRes.status).toBe(200)
+  })
+
+  describe('stream: true', () => {
+    it('streams role, content deltas, and a final stop chunk terminated by [DONE]', async () => {
+      const runner = fakeRunner()
+      const { app } = appWith(runner)
+      const reqPromise = request(app).post('/v1/chat/completions').send({
+        sessionId: 's1', projectPath: '/app/workspace/proj', stream: true,
+        messages: [{ role: 'user', content: 'hello' }],
+      })
+      reqPromise.catch(() => {})
+      await waitForPending(runner)
+      runner.pending[0].opts.onDelta('Hi ')
+      runner.pending[0].opts.onDelta('there!')
+      runner.pending[0].resolve(outcome())
+      const res = await reqPromise
+
+      expect(res.headers['content-type']).toMatch(/text\/event-stream/)
+      const events = res.text
+        .split('\n\n')
+        .filter((line) => line.startsWith('data: '))
+        .map((line) => line.slice('data: '.length))
+
+      expect(events[events.length - 1]).toBe('[DONE]')
+      const chunks = events.slice(0, -1).map((e) => JSON.parse(e))
+      expect(chunks[0].choices[0].delta).toEqual({ role: 'assistant' })
+      expect(chunks[0].object).toBe('chat.completion.chunk')
+      const contentChunks = chunks.filter((c) => c.choices[0]?.delta?.content)
+      expect(contentChunks.map((c) => c.choices[0].delta.content)).toEqual(['Hi ', 'there!'])
+      const lastChunk = chunks[chunks.length - 1]
+      expect(lastChunk.choices[0].finish_reason).toBe('stop')
+    })
+
+    it('includes a trailing usage chunk when stream_options.include_usage is true', async () => {
+      const runner = fakeRunner()
+      const { app } = appWith(runner)
+      const reqPromise = request(app).post('/v1/chat/completions').send({
+        sessionId: 's1', projectPath: '/app/workspace/proj', stream: true,
+        stream_options: { include_usage: true },
+        messages: [{ role: 'user', content: 'hello' }],
+      })
+      reqPromise.catch(() => {})
+      await waitForPending(runner)
+      runner.pending[0].resolve(outcome())
+      const res = await reqPromise
+
+      const chunks = res.text
+        .split('\n\n')
+        .filter((line) => line.startsWith('data: '))
+        .map((line) => line.slice('data: '.length))
+        .filter((line) => line !== '[DONE]')
+        .map((line) => JSON.parse(line))
+
+      const usageChunk = chunks.find((c) => c.usage)
+      expect(usageChunk.usage).toEqual({ prompt_tokens: 12, completion_tokens: 4, total_tokens: 16 })
+      expect(usageChunk.choices).toEqual([])
+    })
+
+    it('still returns a plain JSON 400 for an invalid streaming request', async () => {
+      const runner = fakeRunner()
+      const { app } = appWith(runner)
+      const res = await request(app).post('/v1/chat/completions').send({
+        sessionId: 's1', projectPath: '/app/workspace/proj', stream: true, messages: [],
+      })
+      expect(res.status).toBe(400)
+      expect(res.headers['content-type']).toMatch(/json/)
+      expect(res.body.error.type).toBe('invalid_request')
+    })
   })
 })
