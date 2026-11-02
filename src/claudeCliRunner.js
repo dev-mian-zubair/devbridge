@@ -9,18 +9,22 @@ import crypto from 'node:crypto'
 // chat-completions route streams from and reports usage from — it replaces
 // screen-scraping the interactive TUI with a structured, documented format.
 //
-// `--permission-prompts none` denies (instead of hanging on) anything that
+// `--permission-prompts none` denies (instead of hanging on) any prompt that
 // would otherwise need a live human to approve a tool call: there is no
 // terminal attached to approve it in this mode, so the alternative is an
-// indefinite hang. `--session-id`/`--resume` map directly onto this proxy's
-// own sessionId for multi-turn continuity, without needing to keep a process
-// alive between turns the way the PTY-based approach did.
+// indefinite hang. It does not change what the permission MODE itself allows
+// — tools already allow-listed by the user's own Claude Code settings still
+// run unattended, exactly as they would in an interactive session; only the
+// prompts that would otherwise block on a human are turned into denials.
+// --session-id/--resume map directly onto this proxy's own sessionId for
+// multi-turn continuity, without needing to keep a process alive between
+// turns the way the PTY-based approach did.
 function spawnEnv() {
   const { ANTHROPIC_API_KEY, ...rest } = process.env
   return rest
 }
 
-function buildArgs({ claudeSessionId, model, systemPrompt }) {
+function buildArgs({ claudeSessionId, model, systemPrompt, freshSessionId }) {
   const args = [
     '-p',
     '--output-format',
@@ -35,22 +39,62 @@ function buildArgs({ claudeSessionId, model, systemPrompt }) {
   if (claudeSessionId) {
     args.push('--resume', claudeSessionId)
   } else {
-    args.push('--session-id', crypto.randomUUID())
+    args.push('--session-id', freshSessionId)
   }
   return args
 }
 
-export function createClaudeCliRunner(spawnFn = spawn) {
+// Signals the whole process group the CLI's child process leads (spawned
+// with `detached: true` for exactly this reason), so a Bash/MCP subprocess
+// it fanned out to is killed too instead of being orphaned. Falls back to
+// signaling the child directly when there's no real pid to form a group
+// from (a test double, or a process.kill failure on a platform without
+// POSIX process groups).
+function signalProcessGroup(child, signal) {
+  const pid = child.pid
+  if (typeof pid === 'number' && Number.isInteger(pid)) {
+    try {
+      process.kill(-pid, signal)
+      return
+    } catch {
+      // No real process group (e.g. a test double) — fall through.
+    }
+  }
+  try {
+    child.kill(signal)
+  } catch {
+    // Already gone; nothing left to signal.
+  }
+}
+
+export function createClaudeCliRunner(spawnFn = spawn, { killGraceMs = 5000 } = {}) {
   return {
     runTurn({ content, projectPath, claudeSessionId, model, systemPrompt, onDelta }) {
-      const args = buildArgs({ claudeSessionId, model, systemPrompt })
-      const fallbackSessionId = claudeSessionId ?? args[args.indexOf('--session-id') + 1]
-      const child = spawnFn('claude', args, { cwd: projectPath, env: spawnEnv() })
+      const freshSessionId = claudeSessionId ? undefined : crypto.randomUUID()
+      const args = buildArgs({ claudeSessionId, model, systemPrompt, freshSessionId })
+      const chosenSessionId = claudeSessionId ?? freshSessionId
+
+      let child
+      try {
+        child = spawnFn('claude', args, { cwd: projectPath, env: spawnEnv(), detached: true })
+      } catch (err) {
+        // A synchronous spawn() throw (e.g. ERR_INVALID_ARG_VALUE from a
+        // stray NUL byte that slipped past route-level validation, E2BIG)
+        // must never escape runTurn() — nothing here would catch it, and an
+        // uncaught exception takes the whole server down (Node exits on an
+        // unhandled rejection too, which this would otherwise become).
+        return { promise: Promise.reject(err), kill: () => {}, claudeSessionId: chosenSessionId }
+      }
 
       let buffered = ''
       let stderrBuf = ''
       let settled = false
+      let exited = false
       let capturedModel = null
+
+      child.on('close', () => {
+        exited = true
+      })
 
       const promise = new Promise((resolve, reject) => {
         function settleResolve(value) {
@@ -91,7 +135,7 @@ export function createClaudeCliRunner(spawnFn = spawn) {
               text: event.result ?? '',
               usage: event.usage ?? null,
               totalCostUsd: event.total_cost_usd ?? null,
-              claudeSessionId: event.session_id ?? fallbackSessionId,
+              claudeSessionId: event.session_id ?? chosenSessionId,
               isError: Boolean(event.is_error),
               stopReason: event.stop_reason ?? null,
               subtype: event.subtype ?? null,
@@ -100,8 +144,12 @@ export function createClaudeCliRunner(spawnFn = spawn) {
           }
         }
 
-        child.stdout.on('data', (chunk) => {
-          buffered += chunk.toString()
+        // setEncoding uses a StringDecoder internally, so a multi-byte UTF-8
+        // character split across two chunks decodes correctly instead of
+        // producing U+FFFD at the boundary (chunk.toString() per chunk does not).
+        child.stdout.setEncoding('utf8')
+        child.stdout.on('data', (strChunk) => {
+          buffered += strChunk
           let idx
           while ((idx = buffered.indexOf('\n')) !== -1) {
             const line = buffered.slice(0, idx)
@@ -110,13 +158,29 @@ export function createClaudeCliRunner(spawnFn = spawn) {
           }
         })
 
-        child.stderr.on('data', (chunk) => {
-          stderrBuf += chunk.toString()
+        child.stderr.setEncoding('utf8')
+        child.stderr.on('data', (strChunk) => {
+          // Capped: this only ever feeds a truncated diagnostic message, not
+          // anything parsed, so there's no reason to let it grow unbounded.
+          stderrBuf = (stderrBuf + strChunk).slice(-4096)
         })
+
+        // A write (or the pending buffered data) after the child has already
+        // exited surfaces as EPIPE on stdin. Without a listener, that's an
+        // uncaught exception that crashes the whole process; the child's own
+        // 'close' handler below is what actually settles this turn's outcome.
+        child.stdin.on('error', () => {})
 
         child.on('error', (err) => settleReject(err))
 
         child.on('close', (code) => {
+          // A result line with no trailing newline stays in the buffer until
+          // the process exits — flush it before deciding this turn failed.
+          if (buffered.trim()) {
+            const trailing = buffered
+            buffered = ''
+            handleLine(trailing)
+          }
           if (settled) return
           settleReject(new Error(`claude CLI exited with code ${code}${stderrBuf.trim() ? `: ${stderrBuf.trim()}` : ''}`))
         })
@@ -127,7 +191,16 @@ export function createClaudeCliRunner(spawnFn = spawn) {
 
       return {
         promise,
-        kill: () => child.kill(),
+        claudeSessionId: chosenSessionId,
+        kill: () => {
+          if (exited) return
+          signalProcessGroup(child, 'SIGTERM')
+          const killTimer = setTimeout(() => {
+            if (!exited) signalProcessGroup(child, 'SIGKILL')
+          }, killGraceMs)
+          killTimer.unref?.()
+          child.once('close', () => clearTimeout(killTimer))
+        },
       }
     },
   }

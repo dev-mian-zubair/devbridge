@@ -4,7 +4,9 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends python3 make g++ \
     && rm -rf /var/lib/apt/lists/*
 
-# Pin deliberately; EOT detection depends on this CLI's exact terminal output format.
+# Pin deliberately: both execution paths (the chat-completions route's
+# stream-json event shapes and the debug terminal's PTY output) depend on
+# this CLI version's exact behavior.
 RUN npm install -g @anthropic-ai/claude-code@2.1.316
 
 WORKDIR /app

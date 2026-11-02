@@ -1,12 +1,15 @@
-import { describe, it, expect, vi } from 'vitest'
+import { describe, it, expect, vi, afterEach } from 'vitest'
 import { EventEmitter } from 'node:events'
+import { PassThrough } from 'node:stream'
 import { createClaudeCliRunner } from '../src/claudeCliRunner.js'
 
 function fakeChild() {
   const child = new EventEmitter()
-  child.stdout = new EventEmitter()
-  child.stderr = new EventEmitter()
-  child.stdin = { write: vi.fn(), end: vi.fn() }
+  child.stdout = new PassThrough()
+  child.stderr = new PassThrough()
+  child.stdin = new PassThrough()
+  vi.spyOn(child.stdin, 'write')
+  vi.spyOn(child.stdin, 'end')
   child.kill = vi.fn()
   return child
 }
@@ -46,6 +49,10 @@ function messageStartLine(model) {
 }
 
 describe('createClaudeCliRunner', () => {
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
   it('spawns claude in print/stream-json mode with a fresh --session-id when none is given', () => {
     const child = fakeChild()
     const spawnFn = vi.fn(() => child)
@@ -72,6 +79,18 @@ describe('createClaudeCliRunner', () => {
     const sessionIdIndex = args.indexOf('--session-id') + 1
     expect(args[sessionIdIndex]).toMatch(/^[0-9a-f-]{36}$/)
     expect(opts.cwd).toBe('/app/workspace/proj')
+  })
+
+  it('returns the --session-id it generated synchronously, before the turn settles', () => {
+    const child = fakeChild()
+    const spawnFn = vi.fn(() => child)
+    const runner = createClaudeCliRunner(spawnFn)
+
+    const { claudeSessionId } = runner.runTurn({ content: 'hello', projectPath: '/app/workspace/proj' })
+    expect(claudeSessionId).toMatch(/^[0-9a-f-]{36}$/)
+
+    const [, args] = spawnFn.mock.calls[0]
+    expect(args[args.indexOf('--session-id') + 1]).toBe(claudeSessionId)
   })
 
   it('writes the content to stdin and closes it', () => {
@@ -155,6 +174,24 @@ describe('createClaudeCliRunner', () => {
     expect(onDelta).toHaveBeenCalledWith('split chunk')
   })
 
+  it('decodes a multi-byte UTF-8 character correctly even when split across chunk boundaries', async () => {
+    const child = fakeChild()
+    const spawnFn = vi.fn(() => child)
+    const runner = createClaudeCliRunner(spawnFn)
+    const onDelta = vi.fn()
+
+    const { promise } = runner.runTurn({ content: 'hi', projectPath: '/app/workspace/proj', onDelta })
+    const lineBuf = Buffer.from(deltaLine('🎉🎉'), 'utf8')
+    // Split mid-way through the multi-byte emoji sequence, not on a line boundary.
+    const splitAt = Math.floor(lineBuf.length / 2)
+    child.stdout.write(lineBuf.subarray(0, splitAt))
+    child.stdout.write(lineBuf.subarray(splitAt))
+    child.stdout.write(Buffer.from(resultLine(), 'utf8'))
+    await promise
+
+    expect(onDelta).toHaveBeenCalledWith('🎉🎉')
+  })
+
   it('resolves with text, usage, claudeSessionId, stopReason once the result line arrives', async () => {
     const child = fakeChild()
     const spawnFn = vi.fn(() => child)
@@ -225,6 +262,20 @@ describe('createClaudeCliRunner', () => {
     await assertion
   })
 
+  it('resolves from a final result line that has no trailing newline', async () => {
+    const child = fakeChild()
+    const spawnFn = vi.fn(() => child)
+    const runner = createClaudeCliRunner(spawnFn)
+
+    const { promise } = runner.runTurn({ content: 'hi', projectPath: '/app/workspace/proj' })
+    // No '\n' after this line — it stays in the internal buffer until 'close'.
+    child.stdout.emit('data', JSON.stringify({ type: 'result', result: 'OK', session_id: 's1', is_error: false }))
+    child.emit('close', 0)
+    const outcome = await promise
+
+    expect(outcome.text).toBe('OK')
+  })
+
   it('ignores a close event that arrives after the result line already settled the promise', async () => {
     const child = fakeChild()
     const spawnFn = vi.fn(() => child)
@@ -236,7 +287,36 @@ describe('createClaudeCliRunner', () => {
     expect(() => child.emit('close', 0)).not.toThrow()
   })
 
-  it('kill() kills the underlying child process', () => {
+  it('does not throw when spawnFn itself throws synchronously, and the promise rejects instead', async () => {
+    const spawnFn = vi.fn(() => {
+      throw new Error('spawn ENOENT')
+    })
+    const runner = createClaudeCliRunner(spawnFn)
+
+    let outcome
+    expect(() => {
+      outcome = runner.runTurn({ content: 'hi', projectPath: '/app/workspace/proj' })
+    }).not.toThrow()
+    await expect(outcome.promise).rejects.toThrow('spawn ENOENT')
+    expect(outcome.kill).toBeTypeOf('function')
+    expect(() => outcome.kill()).not.toThrow()
+  })
+
+  it('does not crash when the stdin write fails with EPIPE after the child has already died', async () => {
+    const child = fakeChild()
+    const spawnFn = vi.fn(() => child)
+    const runner = createClaudeCliRunner(spawnFn)
+
+    const { promise } = runner.runTurn({ content: 'hi', projectPath: '/app/workspace/proj' })
+    const epipe = new Error('write EPIPE')
+    epipe.code = 'EPIPE'
+    expect(() => child.stdin.emit('error', epipe)).not.toThrow()
+
+    child.emit('close', 1)
+    await expect(promise).rejects.toThrow(/exited with code 1/)
+  })
+
+  it('kill() kills the underlying child process when it has no real pid (test double)', () => {
     const child = fakeChild()
     const spawnFn = vi.fn(() => child)
     const runner = createClaudeCliRunner(spawnFn)
@@ -244,6 +324,52 @@ describe('createClaudeCliRunner', () => {
     const { kill } = runner.runTurn({ content: 'hi', projectPath: '/app/workspace/proj' })
     kill()
 
-    expect(child.kill).toHaveBeenCalled()
+    expect(child.kill).toHaveBeenCalledWith('SIGTERM')
+  })
+
+  it('kill() signals the whole process group when the child has a real pid', () => {
+    const child = fakeChild()
+    child.pid = 4242
+    const spawnFn = vi.fn(() => child)
+    const runner = createClaudeCliRunner(spawnFn)
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true)
+
+    const { kill } = runner.runTurn({ content: 'hi', projectPath: '/app/workspace/proj' })
+    kill()
+
+    expect(killSpy).toHaveBeenCalledWith(-4242, 'SIGTERM')
+    expect(child.kill).not.toHaveBeenCalled()
+  })
+
+  it('escalates to SIGKILL if the process has not exited after the grace period', async () => {
+    const child = fakeChild()
+    child.pid = 4242
+    const spawnFn = vi.fn(() => child)
+    const runner = createClaudeCliRunner(spawnFn, { killGraceMs: 20 })
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true)
+
+    const { kill } = runner.runTurn({ content: 'hi', projectPath: '/app/workspace/proj' })
+    kill()
+    await new Promise((resolve) => setTimeout(resolve, 60))
+
+    expect(killSpy).toHaveBeenCalledWith(-4242, 'SIGTERM')
+    expect(killSpy).toHaveBeenCalledWith(-4242, 'SIGKILL')
+  })
+
+  it('does not escalate to SIGKILL if the process already exited before the grace period', async () => {
+    const child = fakeChild()
+    child.pid = 4242
+    const spawnFn = vi.fn(() => child)
+    const runner = createClaudeCliRunner(spawnFn, { killGraceMs: 20 })
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true)
+
+    const { promise, kill } = runner.runTurn({ content: 'hi', projectPath: '/app/workspace/proj' })
+    promise.catch(() => {})
+    kill()
+    child.emit('close', 0)
+    await new Promise((resolve) => setTimeout(resolve, 60))
+
+    expect(killSpy).toHaveBeenCalledWith(-4242, 'SIGTERM')
+    expect(killSpy).not.toHaveBeenCalledWith(-4242, 'SIGKILL')
   })
 })
