@@ -20,6 +20,35 @@ describe('createServer', () => {
     expect(res.status).not.toBe(404)
   })
 
+  describe('Cross-origin / DNS-rebinding protection on HTTP routes', () => {
+    it('rejects a request whose Host header is not a loopback hostname, even without Origin', async () => {
+      const { app } = createServer({ port: 0, host: '127.0.0.1', execTimeoutMs: 1000 }, vi.fn())
+      const res = await request(app).get('/').set('Host', 'evil.example')
+      expect(res.status).toBe(403)
+    })
+
+    it('rejects a request whose Host is loopback but whose Origin is not (cross-site POST)', async () => {
+      const spawnFn = vi.fn(() => ({ write: vi.fn(), onData: vi.fn(), onExit: vi.fn(), kill: vi.fn() }))
+      const { app } = createServer({ port: 0, host: '127.0.0.1', execTimeoutMs: 1000 }, spawnFn)
+      const res = await request(app).post('/v1/chat/completions')
+        .set('Origin', 'http://evil.example')
+        .send({ sessionId: 's1', projectPath: '/app/workspace/proj', messages: [{ role: 'user', content: 'hi' }] })
+      expect(res.status).toBe(403)
+    })
+
+    it('allows a request with a loopback Host and no Origin (non-browser client)', async () => {
+      const { app } = createServer({ port: 0, host: '127.0.0.1', execTimeoutMs: 1000 }, vi.fn())
+      const res = await request(app).get('/')
+      expect(res.status).toBe(200)
+    })
+
+    it('allows a request with a loopback Host and a loopback Origin', async () => {
+      const { app } = createServer({ port: 0, host: '127.0.0.1', execTimeoutMs: 1000 }, vi.fn())
+      const res = await request(app).get('/').set('Origin', 'http://127.0.0.1:3000')
+      expect(res.status).toBe(200)
+    })
+  })
+
   describe('WS /api/session/stream origin check', () => {
     let httpServer
 
