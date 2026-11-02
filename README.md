@@ -39,6 +39,10 @@ docker run \
   (`CLAUDE_CONFIG_DIR=/data/.claude` inside the container).
 - Mount each project you want to work on under `/app/workspace/...` and pass
   that container path as `projectPath` in API requests.
+- The image binds the server to `0.0.0.0` *inside* the container — the
+  `-p 127.0.0.1:3000:3000` above is what keeps it off the network, same as
+  local dev's own `127.0.0.1` default (PRD §5.2). Don't publish the port
+  without the `127.0.0.1:` prefix.
 
 ## Signing in (`/login` flow)
 

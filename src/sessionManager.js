@@ -1,3 +1,5 @@
+import path from 'node:path'
+
 export class SessionConflictError extends Error {
   constructor(sessionId, existingProjectPath, requestedProjectPath) {
     super(
@@ -8,6 +10,19 @@ export class SessionConflictError extends Error {
     this.existingProjectPath = existingProjectPath
     this.requestedProjectPath = requestedProjectPath
   }
+}
+
+export class InvalidProjectPathError extends Error {
+  constructor(projectPath) {
+    super(`projectPath must be a non-empty absolute path, got ${JSON.stringify(projectPath)}`)
+    this.name = 'InvalidProjectPathError'
+    this.projectPath = projectPath
+  }
+}
+
+function spawnEnv() {
+  const { ANTHROPIC_API_KEY, ...rest } = process.env
+  return rest
 }
 
 export function createSessionManager(spawnFn) {
@@ -23,15 +38,24 @@ export function createSessionManager(spawnFn) {
         return existing
       }
 
+      if (typeof projectPath !== 'string' || projectPath.length === 0 || !path.isAbsolute(projectPath)) {
+        throw new InvalidProjectPathError(projectPath)
+      }
+
       const pty = spawnFn('claude', [], {
         name: 'xterm-256color',
         cols: 120,
         rows: 40,
         cwd: projectPath,
-        env: process.env,
+        env: spawnEnv(),
       })
       const session = { sessionId, projectPath, pty }
       sessions.set(sessionId, session)
+      pty.onExit(() => {
+        if (sessions.get(sessionId) === session) {
+          sessions.delete(sessionId)
+        }
+      })
       return session
     },
     get(sessionId) {

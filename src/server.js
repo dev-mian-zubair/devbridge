@@ -12,6 +12,16 @@ import { createSessionStreamHandler } from './ws/sessionStream.js'
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const publicDir = path.join(__dirname, '..', 'public')
 
+function isAllowedOrigin({ req }) {
+  const origin = req.headers.origin
+  if (!origin) return true
+  try {
+    return new URL(origin).host === req.headers.host
+  } catch {
+    return false
+  }
+}
+
 export function createApp(sessionManager, { timeoutMs = 120000 } = {}) {
   const app = express()
   app.use(express.json())
@@ -24,7 +34,11 @@ export function createServer(config, spawnFn) {
   const sessionManager = createSessionManager(spawnFn)
   const app = createApp(sessionManager, { timeoutMs: config.execTimeoutMs })
   const httpServer = http.createServer(app)
-  const wss = new WebSocketServer({ server: httpServer, path: '/api/session/stream' })
+  const wss = new WebSocketServer({
+    server: httpServer,
+    path: '/api/session/stream',
+    verifyClient: isAllowedOrigin,
+  })
   wss.on('connection', createSessionStreamHandler(sessionManager))
   return { app, httpServer, wss }
 }
