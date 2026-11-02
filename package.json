@@ -1,0 +1,23 @@
+{
+  "name": "devbridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "node-pty": "^1.0.0",
+    "strip-ansi": "^7.1.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "supertest": "^7.0.0",
+    "vitest": "^2.1.4"
+  }
+}
