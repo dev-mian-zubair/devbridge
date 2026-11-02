@@ -1,9 +1,25 @@
 # DevBridge
 
-A local-only developer tool that wraps the interactive `@anthropic-ai/claude-code`
-CLI in a `node-pty` pseudo-terminal and exposes it as an HTTP chat-completions
-endpoint, a WebSocket terminal stream, and a minimal admin dashboard. See
-[`docs/PRD.md`](docs/PRD.md) for the full requirements.
+A local-only developer tool that wraps the `@anthropic-ai/claude-code` CLI and
+exposes it as an OpenAI-compatible HTTP chat-completions endpoint, a
+WebSocket terminal stream, and a minimal admin dashboard. See
+[`docs/PRD.md`](docs/PRD.md) for the original requirements.
+
+Two independent execution paths share the CLI, each suited to what it does:
+
+- **`POST /v1/chat/completions`** drives the CLI through its own
+  non-interactive interface (`claude -p --output-format stream-json`), not a
+  pseudo-terminal. This is the CLI's documented scriptable mode: it returns
+  structured JSON events with real per-token streaming and exact token
+  usage, and `--permission-prompts none` guarantees a tool-approval prompt
+  is denied rather than hanging forever (there's no attached terminal to
+  approve it in this mode). Multi-turn continuity uses the CLI's own
+  `--session-id`/`--resume`, not a long-lived process.
+- **The dashboard's debug terminal** (`WS /api/session/stream`) still drives
+  a real interactive session through `node-pty`, because that's genuinely a
+  different job: a human watching and typing into the actual CLI UI. It's
+  created via `POST /api/sessions` and is unrelated to chat-completions'
+  own sessions — the two don't share sessionIds.
 
 ## Local development
 
@@ -55,9 +71,63 @@ docker run \
 
 ## API
 
-- `POST /v1/chat/completions` — send a message to a session's Claude Code
-  CLI and get back its reply once the terminal shows a prompt again. See
-  `docs/PRD.md` §4.1 for the exact request/response shape.
-- `WS /api/session/stream` — raw bidirectional terminal stream for a
-  session, used by the dashboard's debug console and the `/login` flow. See
-  `docs/PRD.md` §4.2.
+### `POST /v1/chat/completions`
+
+```bash
+curl http://127.0.0.1:3000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "sessionId": "s1",
+    "projectPath": "/app/workspace/project",
+    "model": "opus",
+    "messages": [{ "role": "user", "content": "say OK" }]
+  }'
+```
+
+```json
+{
+  "id": "chatcmpl-local-s1-1730000000000",
+  "object": "chat.completion",
+  "created": 1730000000,
+  "model": "claude-opus-5-5",
+  "choices": [
+    { "index": 0, "message": { "role": "assistant", "content": "OK" }, "finish_reason": "stop" }
+  ],
+  "usage": { "prompt_tokens": 11382, "completion_tokens": 4, "total_tokens": 11386 }
+}
+```
+
+- `sessionId`/`projectPath` are required; the same `sessionId` must always be
+  paired with the same `projectPath` (409 `session_conflict` otherwise).
+  `projectPath` must be an absolute path mounted into the container.
+- `model` is optional and passed straight through to `--model` (accepts the
+  CLI's own aliases, e.g. `opus`/`sonnet`/`haiku`, or a full model name).
+  The response always reports the model that actually served the request.
+- Any `role: "system"` messages are joined and sent as `--append-system-prompt`.
+  Only the *last* message's `content` becomes the new turn's prompt — earlier
+  `user`/`assistant` messages aren't replayed, because the CLI session itself
+  (resumed via `--session-id`/`--resume`) already has that history. Send the
+  full OpenAI-style running transcript if you like; only its last entry and
+  any `system` entries are used.
+- `usage` reflects the CLI's real token accounting: `prompt_tokens` is
+  `input_tokens + cache_read_input_tokens + cache_creation_input_tokens`
+  (everything the turn paid to read as context), `completion_tokens` is
+  `output_tokens`.
+- Set `"stream": true` for Server-Sent Events of `chat.completion.chunk`
+  objects (OpenAI wire format), terminated by `data: [DONE]`. Add
+  `"stream_options": {"include_usage": true}` for a trailing usage-only
+  chunk before `[DONE]`, matching the real OpenAI API's own convention.
+- A turn that the assistant itself ends in an error (denied tool call it
+  can't recover from, etc.) comes back as `500 { "error": { "type":
+  "assistant_error" } }` rather than a 200 with made-up content. A turn that
+  doesn't finish within `EXEC_TIMEOUT_MS` comes back as `504 { "error": {
+  "type": "timeout" } }` and the CLI process is killed.
+- `GET /v1/models` lists the model aliases the CLI itself exposes
+  (`--model <alias>`), for clients that probe this before use.
+
+### `WS /api/session/stream`
+
+Raw bidirectional terminal stream for the dashboard's debug console and the
+`/login` flow, backed by a PTY session created with `POST /api/sessions`
+(`{ "sessionId", "projectPath" }`). See `docs/PRD.md` §4.2 for the frame
+shapes.

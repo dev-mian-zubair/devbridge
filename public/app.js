@@ -42,18 +42,18 @@ function renderSessionList() {
 }
 
 // The dashboard only ever talks to sessions the backend already knows
-// about (WS input for an unknown sessionId gets an error frame). A session
-// is created server-side by sessionManager.getOrCreate, which only runs
-// inside the chat-completions route — so adding a session here fires a
-// fire-and-forget bootstrap request with empty content (just an Enter
-// keypress) to spin up its PTY before the operator starts typing into the
-// debug console.
+// about (WS input for an unknown sessionId gets an error frame). This
+// debug terminal drives its own PTY session directly via POST
+// /api/sessions, independent of /v1/chat/completions' own per-turn
+// session bookkeeping — the two are unrelated sessions by design, so a
+// sessionId used here is not implicitly usable as a chat-completions
+// sessionId, and vice versa.
 async function ensureBackendSession(sessionId, projectPath) {
   try {
-    await fetch('/v1/chat/completions', {
+    await fetch('/api/sessions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sessionId, projectPath, messages: [{ role: 'user', content: '' }] }),
+      body: JSON.stringify({ sessionId, projectPath }),
     })
   } catch (err) {
     console.error('Failed to create session', sessionId, err)

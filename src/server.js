@@ -9,6 +9,7 @@ import { createSessionManager } from './sessionManager.js'
 import { createTurnSessions } from './turnSessions.js'
 import { createClaudeCliRunner } from './claudeCliRunner.js'
 import { createChatCompletionsRouter } from './routes/chatCompletions.js'
+import { createModelsRouter } from './routes/models.js'
 import { createSessionStreamHandler } from './ws/sessionStream.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -93,6 +94,7 @@ export function createApp(sessionManager, turnSessions, runner, { timeoutMs = 12
     }
   })
 
+  app.use(createModelsRouter())
   app.use(createChatCompletionsRouter({ sessions: turnSessions, runner, timeoutMs }))
   return app
 }
