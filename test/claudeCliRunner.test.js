@@ -36,6 +36,15 @@ function deltaLine(text) {
   )
 }
 
+function messageStartLine(model) {
+  return (
+    JSON.stringify({
+      type: 'stream_event',
+      event: { type: 'message_start', message: { model, role: 'assistant', content: [] } },
+    }) + '\n'
+  )
+}
+
 describe('createClaudeCliRunner', () => {
   it('spawns claude in print/stream-json mode with a fresh --session-id when none is given', () => {
     const child = fakeChild()
@@ -163,7 +172,21 @@ describe('createClaudeCliRunner', () => {
       isError: false,
       stopReason: 'end_turn',
       subtype: 'success',
+      model: null,
     })
+  })
+
+  it('resolves with the real serving model captured from a message_start event', async () => {
+    const child = fakeChild()
+    const spawnFn = vi.fn(() => child)
+    const runner = createClaudeCliRunner(spawnFn)
+
+    const { promise } = runner.runTurn({ content: 'hi', projectPath: '/app/workspace/proj' })
+    child.stdout.emit('data', messageStartLine('claude-opus-5-5'))
+    child.stdout.emit('data', resultLine())
+    const outcome = await promise
+
+    expect(outcome.model).toBe('claude-opus-5-5')
   })
 
   it('resolves with isError true when the result line reports an error', async () => {

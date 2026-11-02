@@ -22,6 +22,17 @@ describe('withTimeout', () => {
     expect(onTimeout).toHaveBeenCalledTimes(1)
   })
 
+  it('still rejects with a timeout error even if onTimeout itself throws', async () => {
+    const onTimeout = vi.fn(() => {
+      throw new Error('onTimeout blew up')
+    })
+    const neverSettles = new Promise(() => {})
+    const result = withTimeout(neverSettles, onTimeout, 120000)
+    const assertion = expect(result).rejects.toThrow('timeout')
+    await vi.advanceTimersByTimeAsync(120000)
+    await assertion
+  })
+
   it('rejects with the inner promise error when it rejects before the timeout', async () => {
     const onTimeout = vi.fn()
     const result = withTimeout(Promise.reject(new Error('boom')), onTimeout, 120000)

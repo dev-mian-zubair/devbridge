@@ -1,7 +1,11 @@
 export function withTimeout(promise, onTimeout, timeoutMs) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
-      onTimeout()
+      try {
+        onTimeout()
+      } catch {
+        // A misbehaving callback must never stop the timeout from rejecting.
+      }
       reject(new Error('timeout'))
     }, timeoutMs)
 

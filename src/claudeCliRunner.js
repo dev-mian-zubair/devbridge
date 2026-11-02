@@ -50,6 +50,7 @@ export function createClaudeCliRunner(spawnFn = spawn) {
       let buffered = ''
       let stderrBuf = ''
       let settled = false
+      let capturedModel = null
 
       const promise = new Promise((resolve, reject) => {
         function settleResolve(value) {
@@ -71,6 +72,11 @@ export function createClaudeCliRunner(spawnFn = spawn) {
             return
           }
 
+          if (event.type === 'stream_event' && event.event?.type === 'message_start') {
+            capturedModel = event.event.message?.model ?? capturedModel
+            return
+          }
+
           if (
             event.type === 'stream_event' &&
             event.event?.type === 'content_block_delta' &&
@@ -89,6 +95,7 @@ export function createClaudeCliRunner(spawnFn = spawn) {
               isError: Boolean(event.is_error),
               stopReason: event.stop_reason ?? null,
               subtype: event.subtype ?? null,
+              model: capturedModel,
             })
           }
         }
