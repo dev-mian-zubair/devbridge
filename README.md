@@ -60,15 +60,17 @@ different interfaces, because the two jobs it does are genuinely different:
     turn and `--resume <id>` on later ones — there's no long-lived process
     kept around between requests; each turn is a fresh `spawn()` that exits
     when it's done.
-- **The dashboard's debug terminal** (`WS /api/session/stream`) still
-  drives a real interactive session through `node-pty`, because that's
-  genuinely a different job: a human watching and typing into the actual
-  CLI UI (most importantly, to complete the `/login` device-code flow,
-  which the non-interactive path above can't do — it denies prompts rather
-  than showing them). It's created via `POST /api/sessions` and is
-  unrelated to chat-completions' own sessions — the two don't share
-  `sessionId`s, don't share state, and a `sessionId` used with one means
-  nothing to the other.
+- **The dashboard's login flow** (`WS /api/session/stream`, `login:*`
+  frames) still drives a real interactive session through `node-pty`,
+  because completing the `/login` device-code flow genuinely needs one —
+  the non-interactive path above denies prompts rather than showing them,
+  so it can't do this. Unlike every other PTY use this project has had,
+  there is exactly **one** of these at a time, globally, independent of
+  any project: it's spawned on demand when the dashboard asks to sign in,
+  and garbage-collected (on completion, on the dashboard disconnecting, or
+  after a timeout) rather than left running — see
+  [`WS /api/session/stream`](#ws-apisessionstream). It has nothing to do
+  with chat-completions' own sessions; the two don't share state.
 
 ### Project layout
 
@@ -80,21 +82,31 @@ src/
   claudeCliRunner.js     Non-PTY path: spawns `claude -p --output-format
                         stream-json`, parses NDJSON events, exposes
                         runTurn({content, projectPath, ...}) -> {promise, kill}.
-  turnSessions.js        In-memory sessionId -> {projectPath, claudeSessionId}
-                        store for the chat-completions path.
-  sessionManager.js      PTY path: spawns/reuses node-pty sessions for the
-                        debug terminal, waits for the CLI to be ready.
+  turnSessions.js        In-memory sessionId -> {projectPath, claudeSessionId,
+                        status, lastRequest, lastResult, lastError} store for
+                        the chat-completions path; publishes session:update
+                        on every mutation.
+  turnEvents.js           Tiny pub/sub bus decoupling publishers
+                        (chatCompletions, turnSessions) from the dashboard's
+                        WS subscribers.
+  loginSession.js         Single-slot PTY dedicated to the `/login` flow:
+                        spawns on demand, reused while active, garbage
+                        collected on completion/disconnect/timeout.
   sessionErrors.js       Shared SessionConflictError / InvalidProjectPathError.
   routes/
     chatCompletions.js   POST /v1/chat/completions — validation, streaming,
-                        usage mapping, error-type mapping.
+                        usage mapping, error-type mapping, turnSessions/
+                        turnEvents updates for the dashboard.
     models.js            GET /v1/models.
   ws/
-    sessionStream.js      WS /api/session/stream handler for the debug terminal.
+    sessionStream.js      WS /api/session/stream handler: session snapshot +
+                        live events on connect, login:* frame handling.
   timeoutGuard.js         withTimeout(promise, onTimeout, timeoutMs) helper.
 public/
-  index.html, app.js,     Minimal admin dashboard: session list, debug
-  style.css               terminal (xterm.js), sign-in flow.
+  index.html, app.js,     Minimal admin dashboard: read-only project/session
+  style.css               tree with live status, sign-in flow. Plain text
+                        throughout — no terminal emulator, since neither the
+                        login flow nor the observability view renders one.
 test/                     vitest + supertest; one file per src module above.
 Dockerfile                node:20-bookworm-slim + globally installed CLI.
 ```
@@ -116,8 +128,8 @@ environment variables — see `.env.example`:
 | `HOST` | `127.0.0.1` | Bind address. Keep this loopback outside Docker. |
 | `CLAUDE_CONFIG_DIR` | CLI default (`~/.claude`) | Where the CLI persists auth/session data. |
 | `EXEC_TIMEOUT_MS` | `120000` | Max time a single turn may run before it's killed. |
-| `READINESS_TIMEOUT_MS` | `5000` | Max time to wait for a fresh PTY session (debug terminal) to become ready. |
-| `READINESS_SETTLE_MS` | `250` | Quiet period used to decide the PTY has finished its startup banner. |
+| `READINESS_TIMEOUT_MS` | `5000` | Max time to wait for the login PTY to become ready. |
+| `READINESS_SETTLE_MS` | `250` | Quiet period used to decide the login PTY has finished its startup banner. |
 | `TRUSTED_HOSTS` | *(empty)* | Comma-separated hostnames (no port — ports are ignored, same as the loopback check) explicitly trusted in addition to `127.0.0.1`/`localhost`/`::1`. For a gateway (LiteLLM, Open WebUI, ...) running in its own container on a private network — see [Using with LiteLLM and other gateways](#using-with-litellm-and-other-openai-compatible-gateways). Never set this to a wildcard or to a hostname you don't control. |
 
 ## Running tests
@@ -126,7 +138,7 @@ environment variables — see `.env.example`:
 npm test
 ```
 
-120+ tests across one file per `src/` module (`vitest` + `supertest`), no
+130+ tests across one file per `src/` module (`vitest` + `supertest`), no
 network access and no real CLI invocation — the CLI process is always
 injected (`spawnFn`) and faked.
 
@@ -165,13 +177,20 @@ docker run -d --name devbridge \
 
 ## Signing in (`/login` flow)
 
-1. Open the dashboard at `http://127.0.0.1:3000/`.
-2. Add a session: enter a `sessionId` and the `projectPath` you mounted
-   into the container (e.g. `/app/workspace/project`), then click **Add
-   session**.
-3. Select that session in the navigator, then click **Sign In**.
-4. The CLI's login URL and confirmation code appear as a clickable link in
-   the dashboard — open it and complete sign-in in your browser.
+1. Open the dashboard at `http://127.0.0.1:3000/` and click **Sign In**.
+2. This spawns a dedicated login session (independent of any project) and
+   types `/login` into it; the CLI's login URL and confirmation code
+   appear as a clickable link once they show up in its output — open the
+   link and authorize in your browser.
+3. Click **Next**, then **Done** once you've authorized — the dashboard
+   also auto-detects completion from the CLI's own output, so **Done** is
+   a confirmation, not the only trigger. The login session is torn down
+   once it's done (or if you close the tab, or after a timeout either way).
+
+There's no "add session" step any more: sessions only ever appear once a
+real request comes in through `/v1/chat/completions`, grouped by project in
+the dashboard's navigator, purely for observability — you can't type into
+them.
 
 Once signed in, the `devbridge-claude-config` volume keeps you signed in
 across container restarts — there's no separate credential step for the
@@ -414,25 +433,44 @@ DevBridge directly. Two things to get right:
 
 ### `WS /api/session/stream`
 
-Raw bidirectional terminal stream for the dashboard's debug console and
-the `/login` flow, backed by a PTY session created with `POST
-/api/sessions` (`{ "sessionId", "projectPath" }`).
+Serves two unrelated purposes over the same connection: a read-only live
+feed of chat-completions activity, and driving the one dedicated login
+PTY. There is no write access to a chat-completions session from here —
+observability only.
 
-Inbound (UI to server):
-
-```json
-{ "type": "input", "sessionId": "string", "data": "raw text/command string" }
-```
-
-Outbound (server to UI):
+**On connect**, the server immediately sends a snapshot of every known
+session:
 
 ```json
-{ "type": "output", "sessionId": "string", "data": "ansi escaped terminal screen text chunk" }
+{ "type": "snapshot", "sessions": [{ "sessionId", "projectPath", "claudeSessionId", "status", "lastRequest", "lastResult", "lastError" }] }
 ```
 
-Only a `sessionId` already created via `POST /api/sessions` can be driven
-this way; input for an unknown `sessionId` gets back a `{"type": "error"}`
-frame instead.
+**Outbound (server to UI), as activity happens:**
+
+```json
+{ "type": "session:update", "session": { "...same shape as above" } }
+{ "type": "session:delta", "sessionId": "string", "text": "assistant text chunk" }
+{ "type": "login:output", "data": "raw PTY output chunk" }
+{ "type": "error", "data": "string" }
+```
+
+`status` is one of `idle` / `running` / `error`. `session:delta` fires
+for every turn's streamed text, whether or not the original HTTP request
+itself asked for `stream: true`.
+
+**Inbound (UI to server), for the login flow only:**
+
+```json
+{ "type": "login:start" }
+{ "type": "login:input", "data": "string" }
+{ "type": "login:complete" }
+```
+
+`login:start` spawns the login PTY if one isn't already running (reused
+otherwise) and types `/login` once it's ready. `login:input` forwards raw
+text to it — used for whatever paste-back step, if any, the flow needs.
+`login:complete` disposes it; so does the WS connection closing while a
+login is pending, and so does a safety timeout if neither fires.
 
 ## Non-functional / safety requirements
 
