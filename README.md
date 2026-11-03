@@ -1,31 +1,103 @@
 # DevBridge
 
-A local-only developer tool that wraps the `@anthropic-ai/claude-code` CLI and
-exposes it as an OpenAI-compatible HTTP chat-completions endpoint, a
-WebSocket terminal stream, and a minimal admin dashboard. See
-[`docs/PRD.md`](docs/PRD.md) for the original requirements.
+DevBridge is a local-only developer tool that wraps the official
+`@anthropic-ai/claude-code` CLI and exposes it as an OpenAI-compatible HTTP
+chat-completions endpoint, a WebSocket terminal stream, and a minimal admin
+dashboard — all in a single Docker container.
 
-Two independent execution paths share the CLI, each suited to what it does:
+## Why this exists
+
+The Claude Code CLI already gives you a capable coding agent from the
+terminal, backed by a Claude Pro/Team **subscription** rather than a
+usage-priced API key. DevBridge's job is to make that same agent reachable
+the way any other LLM backend is reachable: a standard HTTP endpoint that
+takes OpenAI-style chat-completions requests, so local tools, scripts, and
+OpenAI-SDK-based applications under active development can point at it like
+they would point at `api.openai.com`, without paying per-token API rates on
+top of a subscription you already have.
+
+### Core philosophy
+
+- **Local-only, single-user.** This is a development convenience, not a
+  multi-tenant service. It binds to loopback by default and assumes one
+  person, one machine, one CLI session at a time per `sessionId`.
+- **No credential handling of its own.** DevBridge never asks for, stores,
+  or transmits an Anthropic API key. Authentication is the CLI's own
+  `/login` device-code flow, running exactly as it would in a real
+  terminal; DevBridge only gives you a browser window to drive it from.
+- **The CLI is the source of truth.** DevBridge translates wire formats and
+  manages process lifecycles; it never second-guesses what the CLI itself
+  decided (what tools ran, what a turn's stop reason was, what it actually
+  cost).
+
+## Architecture
+
+### Two execution paths, one CLI
+
+DevBridge drives the same underlying `claude` binary through two genuinely
+different interfaces, because the two jobs it does are genuinely different:
 
 - **`POST /v1/chat/completions`** drives the CLI through its own
-  non-interactive interface (`claude -p --output-format stream-json`), not a
-  pseudo-terminal. This is the CLI's documented scriptable mode: it returns
-  structured JSON events with real per-token streaming and exact token
-  usage. `--permission-prompts none` turns any prompt that would otherwise
-  block on a live human into a denial instead of a hang (there's no attached
-  terminal to approve it in this mode) — it does not change what the
-  permission *mode* itself allows: a tool already allow-listed by your own
-  Claude Code settings (`~/.claude/settings.json`, a project's
-  `.claude/settings.json`) still runs unattended here exactly as it would in
-  an interactive session, and a stuck tool invocation (not a permission
-  prompt) is only bounded by `EXEC_TIMEOUT_MS`, same as anything else.
-  Multi-turn continuity uses the CLI's own `--session-id`/`--resume`, not a
-  long-lived process.
-- **The dashboard's debug terminal** (`WS /api/session/stream`) still drives
-  a real interactive session through `node-pty`, because that's genuinely a
-  different job: a human watching and typing into the actual CLI UI. It's
-  created via `POST /api/sessions` and is unrelated to chat-completions'
-  own sessions — the two don't share sessionIds.
+  non-interactive scripting interface: `claude -p --output-format
+  stream-json --include-partial-messages --verbose --permission-prompts
+  none`, launched with plain `child_process.spawn` — no pseudo-terminal.
+  This is the CLI's documented scriptable mode: it emits newline-delimited
+  JSON events with real per-token streaming and exact token usage, and it
+  exits cleanly when the turn is done. There is no terminal-prompt
+  guessing — the CLI itself emits a final `result` event that says the turn
+  is over, so there's nothing to scan for or time out waiting on in the
+  happy path.
+  - `--permission-prompts none` turns any tool-approval prompt that would
+    otherwise block on a live human into a denial instead of a hang
+    (there's no attached terminal to approve it in this mode). It does
+    **not** change what the permission *mode* itself allows: a tool
+    already allow-listed by your own Claude Code settings
+    (`~/.claude/settings.json`, a project's `.claude/settings.json`) still
+    runs unattended here exactly as it would in an interactive session. A
+    tool invocation that just hangs (not a permission prompt) is bounded
+    only by `EXEC_TIMEOUT_MS`, the same as everything else.
+  - Multi-turn continuity uses the CLI's own `--session-id` on a fresh
+    turn and `--resume <id>` on later ones — there's no long-lived process
+    kept around between requests; each turn is a fresh `spawn()` that exits
+    when it's done.
+- **The dashboard's debug terminal** (`WS /api/session/stream`) still
+  drives a real interactive session through `node-pty`, because that's
+  genuinely a different job: a human watching and typing into the actual
+  CLI UI (most importantly, to complete the `/login` device-code flow,
+  which the non-interactive path above can't do — it denies prompts rather
+  than showing them). It's created via `POST /api/sessions` and is
+  unrelated to chat-completions' own sessions — the two don't share
+  `sessionId`s, don't share state, and a `sessionId` used with one means
+  nothing to the other.
+
+### Project layout
+
+```
+src/
+  server.js            Express app wiring: same-origin/DNS-rebinding guard,
+                        mounts both routers, sets up the WS upgrade handler.
+  config.js             Reads PORT/HOST/CLAUDE_CONFIG_DIR/timeout env vars.
+  claudeCliRunner.js     Non-PTY path: spawns `claude -p --output-format
+                        stream-json`, parses NDJSON events, exposes
+                        runTurn({content, projectPath, ...}) -> {promise, kill}.
+  turnSessions.js        In-memory sessionId -> {projectPath, claudeSessionId}
+                        store for the chat-completions path.
+  sessionManager.js      PTY path: spawns/reuses node-pty sessions for the
+                        debug terminal, waits for the CLI to be ready.
+  sessionErrors.js       Shared SessionConflictError / InvalidProjectPathError.
+  routes/
+    chatCompletions.js   POST /v1/chat/completions — validation, streaming,
+                        usage mapping, error-type mapping.
+    models.js            GET /v1/models.
+  ws/
+    sessionStream.js      WS /api/session/stream handler for the debug terminal.
+  timeoutGuard.js         withTimeout(promise, onTimeout, timeoutMs) helper.
+public/
+  index.html, app.js,     Minimal admin dashboard: session list, debug
+  style.css               terminal (xterm.js), sign-in flow.
+test/                     vitest + supertest; one file per src module above.
+Dockerfile                node:20-bookworm-slim + globally installed CLI.
+```
 
 ## Local development
 
@@ -34,9 +106,18 @@ npm install
 npm start
 ```
 
-The server binds to `127.0.0.1:3000` by default (override with `PORT`/`HOST`
-env vars — see `.env.example`). Open `http://127.0.0.1:3000/` for the
-dashboard.
+The server binds to `127.0.0.1:3000` by default. Open
+`http://127.0.0.1:3000/` for the dashboard. Configuration is read from
+environment variables — see `.env.example`:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PORT` | `3000` | HTTP port. |
+| `HOST` | `127.0.0.1` | Bind address. Keep this loopback outside Docker. |
+| `CLAUDE_CONFIG_DIR` | CLI default (`~/.claude`) | Where the CLI persists auth/session data. |
+| `EXEC_TIMEOUT_MS` | `120000` | Max time a single turn may run before it's killed. |
+| `READINESS_TIMEOUT_MS` | `5000` | Max time to wait for a fresh PTY session (debug terminal) to become ready. |
+| `READINESS_SETTLE_MS` | `250` | Quiet period used to decide the PTY has finished its startup banner. |
 
 ## Running tests
 
@@ -44,36 +125,56 @@ dashboard.
 npm test
 ```
 
+91+ tests across one file per `src/` module (`vitest` + `supertest`), no
+network access and no real CLI invocation — the CLI process is always
+injected (`spawnFn`) and faked.
+
 ## Building and running the Docker image
 
 ```bash
 docker build -t devbridge .
 
-docker run \
+docker run -d --name devbridge \
   -p 127.0.0.1:3000:3000 \
-  -v claude-config:/data/.claude \
+  -v devbridge-claude-config:/data/.claude \
   -v /host/path/to/project:/app/workspace/project \
   devbridge
 ```
 
-- `claude-config` is a named Docker volume that persists auth tokens, device
-  configuration, and session history across container restarts
-  (`CLAUDE_CONFIG_DIR=/data/.claude` inside the container).
-- Mount each project you want to work on under `/app/workspace/...` and pass
-  that container path as `projectPath` in API requests.
+- `devbridge-claude-config` is a named Docker volume that persists auth
+  tokens, device configuration, and session history across container
+  restarts (`CLAUDE_CONFIG_DIR=/data/.claude` inside the container).
+- Mount each project you want to work on under `/app/workspace/...` and
+  pass that container path as `projectPath` (or `X-Project-Path`) in API
+  requests.
 - The image binds the server to `0.0.0.0` *inside* the container — the
   `-p 127.0.0.1:3000:3000` above is what keeps it off the network, same as
-  local dev's own `127.0.0.1` default (PRD §5.2). Don't publish the port
-  without the `127.0.0.1:` prefix.
+  local dev's own `127.0.0.1` default. Docker's port-forward lands on the
+  container's own network interface, not its loopback, so a server bound
+  to `127.0.0.1` inside the container would be unreachable even with a
+  published port — the host-side `127.0.0.1:` prefix is the thing actually
+  enforcing network isolation here. **Don't publish the port without
+  it.**
+- The build needs `python3 make g++` (installed in the image) because
+  `node-pty`'s native addon has to compile for the debug-terminal path; the
+  chat-completions path has no native dependencies of its own.
+- The CLI version is pinned in the `Dockerfile` deliberately: both
+  execution paths depend on this exact version's event shapes/behavior.
+  Bumping it means re-verifying both paths, not just updating a number.
 
 ## Signing in (`/login` flow)
 
 1. Open the dashboard at `http://127.0.0.1:3000/`.
-2. Add a session: enter a `sessionId` and the `projectPath` you mounted into
-   the container (e.g. `/app/workspace/project`), then click **Add session**.
+2. Add a session: enter a `sessionId` and the `projectPath` you mounted
+   into the container (e.g. `/app/workspace/project`), then click **Add
+   session**.
 3. Select that session in the navigator, then click **Sign In**.
 4. The CLI's login URL and confirmation code appear as a clickable link in
    the dashboard — open it and complete sign-in in your browser.
+
+Once signed in, the `devbridge-claude-config` volume keeps you signed in
+across container restarts — there's no separate credential step for the
+`/v1/chat/completions` path; it uses the same CLI auth state.
 
 ## API
 
@@ -103,65 +204,151 @@ curl http://127.0.0.1:3000/v1/chat/completions \
 }
 ```
 
+**Session identity**
+
 - `sessionId`/`projectPath` are required, as the `X-Session-Id` /
-  `X-Project-Path` headers (preferred — keeps the JSON body pure OpenAI wire
-  format, so an off-the-shelf OpenAI SDK with default headers configured
-  needs no payload changes) or as `sessionId`/`projectPath` body fields
-  (still supported; a header takes precedence if both are given). The same
-  `sessionId` must always be paired with the same `projectPath` (409
-  `session_conflict` otherwise). `projectPath` must be an absolute path
-  mounted into the container.
-- `model` is optional and passed straight through to `--model` (accepts the
-  CLI's own aliases, e.g. `opus`/`sonnet`/`haiku`, or a full model name),
-  restricted to a safe charset (letters, numbers, `. - _ :`). The
-  non-streaming response always reports the model that actually served the
-  request; in a streaming response only the *last* chunk does — the first
-  (role) chunk is sent immediately, before the CLI has reported which model
+  `X-Project-Path` headers (preferred — this keeps the JSON body pure
+  OpenAI wire format, so an off-the-shelf OpenAI SDK with default headers
+  configured needs no payload changes at all) or as `sessionId`/
+  `projectPath` body fields (still supported for backward compatibility; a
+  header wins if both are given).
+- The same `sessionId` must always be paired with the same `projectPath`
+  (409 `session_conflict` otherwise — this catches accidentally reusing an
+  id across two different projects).
+- `projectPath` must be an absolute path that exists and is a directory
+  inside the container (400 `invalid_project_path` otherwise, checked
+  *before* anything is spawned).
+
+**Request fields**
+
+- `model` is optional and passed straight through to `--model` (accepts
+  the CLI's own aliases, e.g. `opus`/`sonnet`/`haiku`, or a full model
+  name), restricted to a safe charset (letters, numbers, `. - _ :`) so it
+  can never become an unsafe `spawn()` argv element. The non-streaming
+  response always reports the model that actually served the request; in
+  a streaming response only the *last* chunk does — the first (role)
+  chunk is sent immediately, before the CLI has reported which model
   picked up the turn, so it echoes back whatever alias you requested.
-- Any `role: "system"` messages are joined and sent as `--append-system-prompt`.
-  Only the *last* message's `content` becomes the new turn's prompt — earlier
-  `user`/`assistant` messages aren't replayed, because the CLI session itself
-  (resumed via `--session-id`/`--resume`) already has that history. Send the
-  full OpenAI-style running transcript if you like; only its last entry and
-  any `system` entries are used.
+- Any `role: "system"` messages are joined (`\n\n`-separated) and sent as
+  `--append-system-prompt`.
+- Only the *last* message's `content` becomes the new turn's prompt —
+  earlier `user`/`assistant` messages aren't replayed, because the CLI
+  session itself (resumed via `--session-id`/`--resume`) already has that
+  history. Send the full OpenAI-style running transcript if you like; only
+  its last entry and any `system` entries are used.
+- `content` may be a plain string or an OpenAI-style array of
+  `{"type": "text", "text": "..."}` parts, which are concatenated.
+
+**Response fields**
+
 - `usage` reflects the CLI's real token accounting: `prompt_tokens` is
   `input_tokens + cache_read_input_tokens + cache_creation_input_tokens`
-  (everything the turn paid to read as context), `completion_tokens` is
-  `output_tokens`.
+  (everything the turn paid to read as context, including anything served
+  from cache), `completion_tokens` is `output_tokens`.
+- `finish_reason` is `"length"` when the CLI's own stop reason was
+  `max_tokens`, `"stop"` otherwise.
+
+**Streaming**
+
 - Set `"stream": true` for Server-Sent Events of `chat.completion.chunk`
-  objects (OpenAI wire format), terminated by `data: [DONE]`. Add
-  `"stream_options": {"include_usage": true}` for a trailing usage-only
-  chunk before `[DONE]`, matching the real OpenAI API's own convention.
-- A turn that the assistant itself ends in an error (denied tool call it
-  can't recover from, etc.) comes back as `500 { "error": { "type":
-  "assistant_error" } }` rather than a 200 with made-up content. A turn that
-  doesn't finish within `EXEC_TIMEOUT_MS` comes back as `504 { "error": {
-  "type": "timeout" } }` and the CLI process is killed.
-- `GET /v1/models` lists the model aliases the CLI itself exposes
-  (`--model <alias>`), for clients that probe this before use.
+  objects (OpenAI wire format): a role-chunk first, then one delta chunk
+  per token, a final chunk carrying `finish_reason`, all terminated by
+  `data: [DONE]`.
+- Add `"stream_options": {"include_usage": true}` for a trailing
+  usage-only chunk (`choices: []`, `usage: {...}`) before `[DONE]`,
+  matching the real OpenAI API's own convention.
+- If a turn fails *after* streaming has already started (timeout, crash,
+  an `isError` result), an error-shaped chunk (`{"error": {"message":
+  ..., "type": ...}}`) is written before `[DONE]` instead of silently
+  ending the stream as if it had succeeded — this is the shape OpenAI
+  SDKs look for to raise an `APIError` out of a stream.
+
+**Errors**
+
+- A turn the assistant itself ends in an error (a denied tool call it
+  can't recover from, etc.) comes back as `500 {"error": {"type":
+  "assistant_error"}}` rather than a `200` with made-up content.
+- A turn that doesn't finish within `EXEC_TIMEOUT_MS` comes back as `504
+  {"error": {"type": "timeout"}}` and the CLI process is killed (SIGTERM,
+  escalating to SIGKILL after a grace period if it doesn't exit).
+- A second request for a `sessionId` that already has a turn in flight
+  gets `503 {"error": {"type": "session_busy"}}` with `Retry-After: 1` —
+  the CLI session itself can't run two turns concurrently.
 - Error responses use OpenAI's generic type names where one exists
-  (`invalid_request_error`, `server_error`) and proxy-specific ones where it
-  doesn't (`invalid_project_path`, `session_conflict`, `session_busy`,
-  `timeout`, `assistant_error`). `invalid_request_error`, `invalid_project_path`,
-  `session_conflict`, and `assistant_error` responses set
-  `x-should-retry: false`; `session_busy` sets `Retry-After`.
+  (`invalid_request_error`, `server_error`) and proxy-specific ones where
+  it doesn't (`invalid_project_path`, `session_conflict`, `session_busy`,
+  `timeout`, `assistant_error`).
+- `invalid_request_error`, `invalid_project_path`, `session_conflict`, and
+  `assistant_error` responses set `x-should-retry: false` (retrying
+  `assistant_error` in particular could re-run a turn that already
+  executed side-effecting tools); `session_busy` sets `Retry-After`.
+
+### `GET /v1/models`
+
+Lists the model aliases the CLI itself exposes (`opus`, `sonnet`, `haiku`,
+`fable`), for clients that probe this before use.
 
 ### Known limitations
 
-- The `sessionId -> claudeSessionId` mapping lives in memory only. Restart
-  the container (or crash before a session's very first turn completes) and
-  that `sessionId` starts a brand-new CLI conversation on its next request —
-  this is a deliberate choice over optimistically guessing at a CLI session
-  id that might not actually exist yet to `--resume`, which would turn a
-  recoverable "starts fresh" outcome into a permanent "every future request
-  for this sessionId fails" one.
+- The `sessionId -> claudeSessionId` mapping lives in memory only.
+  Restart the container (or crash before a session's very first turn
+  completes) and that `sessionId` starts a brand-new CLI conversation on
+  its next request — this is a deliberate choice over optimistically
+  guessing at a CLI session id that might not actually exist yet to
+  `--resume`, which would turn a recoverable "starts fresh" outcome into a
+  permanent "every future request for this sessionId fails" one.
 - A long-running turn that's actively streaming is still bounded by the
-  same flat `EXEC_TIMEOUT_MS` as everything else, not an idle timer reset on
-  each token — a legitimately long agentic turn can hit it.
+  same flat `EXEC_TIMEOUT_MS` as everything else, not an idle timer reset
+  on each token — a legitimately long agentic turn can hit it.
+- Single-process, single-container: there is no clustering, no shared
+  session store across replicas, and no queueing beyond the one-turn-at-a-
+  time-per-`sessionId` lock described above.
 
 ### `WS /api/session/stream`
 
-Raw bidirectional terminal stream for the dashboard's debug console and the
-`/login` flow, backed by a PTY session created with `POST /api/sessions`
-(`{ "sessionId", "projectPath" }`). See `docs/PRD.md` §4.2 for the frame
-shapes.
+Raw bidirectional terminal stream for the dashboard's debug console and
+the `/login` flow, backed by a PTY session created with `POST
+/api/sessions` (`{ "sessionId", "projectPath" }`).
+
+Inbound (UI to server):
+
+```json
+{ "type": "input", "sessionId": "string", "data": "raw text/command string" }
+```
+
+Outbound (server to UI):
+
+```json
+{ "type": "output", "sessionId": "string", "data": "ansi escaped terminal screen text chunk" }
+```
+
+Only a `sessionId` already created via `POST /api/sessions` can be driven
+this way; input for an unknown `sessionId` gets back a `{"type": "error"}`
+frame instead.
+
+## Non-functional / safety requirements
+
+These are the project's hard constraints, not just defaults someone could
+reconfigure away:
+
+1. **No external credentials.** DevBridge never requests, stores, or
+   transmits an Anthropic developer API key. The CLI's own `/login`
+   device-code flow is the only authentication path, and it runs exactly
+   as it would in a real terminal.
+2. **Network isolation.** The server binds to `127.0.0.1` by default, and
+   the Docker instructions above exist specifically to preserve that
+   outside a container too — the published port is deliberately prefixed
+   with `127.0.0.1:` rather than left open on all interfaces.
+3. **Same-origin / DNS-rebinding protection.** Every HTTP route and the WS
+   upgrade both check `Host` *and* `Origin` independently against a fixed
+   loopback allowlist (`127.0.0.1`, `localhost`, `::1`), because DNS
+   rebinding can make an attacker-controlled hostname resolve to
+   `127.0.0.1` — comparing `Host` and `Origin` to each other instead of to
+   a fixed allowlist would prove nothing in that scenario.
+4. **Execution timeouts.** No turn runs unbounded: `EXEC_TIMEOUT_MS`
+   bounds `/v1/chat/completions` turns (process killed on expiry); the PTY
+   debug path has its own readiness/settle timeouts for startup.
+
+## License
+
+Private, unpublished project.
