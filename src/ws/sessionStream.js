@@ -1,3 +1,11 @@
+// TIOCSWINSZ's winsize struct fields are unsigned 16-bit, so anything above
+// 65535 wraps to an unrelated value instead of erroring; these bounds are
+// also just how large a real terminal panel could plausibly be, so a huge
+// client-supplied size is rejected well below the wrap point, not clamped
+// up to it.
+const MAX_COLS = 500
+const MAX_ROWS = 300
+
 export function createSessionStreamHandler(sessionManager) {
   return (ws, _request) => {
     const disposables = new Map()
@@ -20,7 +28,11 @@ export function createSessionStreamHandler(sessionManager) {
       // output. The client sends its real size once it knows it (after
       // fitting to its container) and on every resize after that.
       if (type === 'resize') {
-        if (typeof sessionId !== 'string' || !Number.isInteger(cols) || !Number.isInteger(rows) || cols <= 0 || rows <= 0) {
+        if (
+          typeof sessionId !== 'string' ||
+          !Number.isInteger(cols) || !Number.isInteger(rows) ||
+          cols <= 0 || rows <= 0 || cols > MAX_COLS || rows > MAX_ROWS
+        ) {
           ws.send(JSON.stringify({ type: 'error', sessionId: sessionId ?? null, data: 'invalid frame' }))
           return
         }
@@ -29,7 +41,11 @@ export function createSessionStreamHandler(sessionManager) {
           ws.send(JSON.stringify({ type: 'error', sessionId, data: 'unknown session' }))
           return
         }
-        session.pty.resize(cols, rows)
+        try {
+          session.pty.resize(cols, rows)
+        } catch {
+          ws.send(JSON.stringify({ type: 'error', sessionId, data: 'resize failed' }))
+        }
         return
       }
 

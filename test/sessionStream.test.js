@@ -117,6 +117,32 @@ describe('createSessionStreamHandler', () => {
     expect(ws.send).toHaveBeenCalledWith(JSON.stringify({ type: 'error', sessionId: 's1', data: 'invalid frame' }))
   })
 
+  it('sends an error frame for a resize frame with cols/rows above the sane upper bound, without ever calling resize', async () => {
+    const { spawnFn } = fakePtyFactory()
+    const sessionManager = createSessionManager(spawnFn, FAKE_STAT)
+    const session = await sessionManager.getOrCreate('s1', '/app/workspace/proj')
+    const ws = fakeWs()
+    const handler = createSessionStreamHandler(sessionManager)
+    handler(ws, {})
+    const onMessage = ws.on.mock.calls.find(([event]) => event === 'message')[1]
+    expect(() => onMessage(JSON.stringify({ type: 'resize', sessionId: 's1', cols: 100000, rows: 30 }))).not.toThrow()
+    expect(ws.send).toHaveBeenCalledWith(JSON.stringify({ type: 'error', sessionId: 's1', data: 'invalid frame' }))
+    expect(session.pty.resize).not.toHaveBeenCalled()
+  })
+
+  it('sends an error frame instead of throwing when pty.resize itself throws', async () => {
+    const { spawnFn } = fakePtyFactory()
+    const sessionManager = createSessionManager(spawnFn, FAKE_STAT)
+    const session = await sessionManager.getOrCreate('s1', '/app/workspace/proj')
+    session.pty.resize.mockImplementation(() => { throw new Error('ioctl failed') })
+    const ws = fakeWs()
+    const handler = createSessionStreamHandler(sessionManager)
+    handler(ws, {})
+    const onMessage = ws.on.mock.calls.find(([event]) => event === 'message')[1]
+    expect(() => onMessage(JSON.stringify({ type: 'resize', sessionId: 's1', cols: 100, rows: 30 }))).not.toThrow()
+    expect(ws.send).toHaveBeenCalledWith(JSON.stringify({ type: 'error', sessionId: 's1', data: 'resize failed' }))
+  })
+
   it('sends an error frame for a resize frame targeting an unknown sessionId', () => {
     const sessionManager = createSessionManager(vi.fn())
     const ws = fakeWs()
