@@ -24,7 +24,7 @@ function spawnEnv() {
   return rest
 }
 
-function buildArgs({ claudeSessionId, model, systemPrompt, freshSessionId }) {
+function buildArgs({ claudeSessionId, model, systemPrompt, effort, jsonSchema, freshSessionId }) {
   const args = [
     '-p',
     '--output-format',
@@ -36,6 +36,8 @@ function buildArgs({ claudeSessionId, model, systemPrompt, freshSessionId }) {
   ]
   if (model) args.push('--model', model)
   if (systemPrompt) args.push('--append-system-prompt', systemPrompt)
+  if (effort) args.push('--effort', effort)
+  if (jsonSchema) args.push('--json-schema', JSON.stringify(jsonSchema))
   if (claudeSessionId) {
     args.push('--resume', claudeSessionId)
   } else {
@@ -69,9 +71,9 @@ function signalProcessGroup(child, signal) {
 
 export function createClaudeCliRunner(spawnFn = spawn, { killGraceMs = 5000 } = {}) {
   return {
-    runTurn({ content, projectPath, claudeSessionId, model, systemPrompt, onDelta }) {
+    runTurn({ content, projectPath, claudeSessionId, model, systemPrompt, effort, jsonSchema, onDelta }) {
       const freshSessionId = claudeSessionId ? undefined : crypto.randomUUID()
-      const args = buildArgs({ claudeSessionId, model, systemPrompt, freshSessionId })
+      const args = buildArgs({ claudeSessionId, model, systemPrompt, effort, jsonSchema, freshSessionId })
       const chosenSessionId = claudeSessionId ?? freshSessionId
 
       let child

@@ -144,6 +144,33 @@ describe('createClaudeCliRunner', () => {
     expect(args[index + 1]).toBe('Be terse.')
   })
 
+  it('passes --effort when an effort level is given', () => {
+    const child = fakeChild()
+    const spawnFn = vi.fn(() => child)
+    const runner = createClaudeCliRunner(spawnFn)
+
+    runner.runTurn({ content: 'hi', projectPath: '/app/workspace/proj', effort: 'high' })
+
+    const [, args] = spawnFn.mock.calls[0]
+    const index = args.indexOf('--effort')
+    expect(index).toBeGreaterThan(-1)
+    expect(args[index + 1]).toBe('high')
+  })
+
+  it('passes --json-schema as a JSON string when a jsonSchema is given', () => {
+    const child = fakeChild()
+    const spawnFn = vi.fn(() => child)
+    const runner = createClaudeCliRunner(spawnFn)
+    const schema = { type: 'object', properties: { name: { type: 'string' } }, required: ['name'] }
+
+    runner.runTurn({ content: 'hi', projectPath: '/app/workspace/proj', jsonSchema: schema })
+
+    const [, args] = spawnFn.mock.calls[0]
+    const index = args.indexOf('--json-schema')
+    expect(index).toBeGreaterThan(-1)
+    expect(JSON.parse(args[index + 1])).toEqual(schema)
+  })
+
   it('emits each text_delta to onDelta, in order', async () => {
     const child = fakeChild()
     const spawnFn = vi.fn(() => child)

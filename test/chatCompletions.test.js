@@ -77,7 +77,7 @@ describe('POST /v1/chat/completions', () => {
     expect(res.status).toBe(200)
     expect(res.body.object).toBe('chat.completion')
     expect(res.body.model).toBe('claude-opus-5-5')
-    expect(res.body.choices[0].message).toEqual({ role: 'assistant', content: 'Hi there!' })
+    expect(res.body.choices[0].message).toEqual({ role: 'assistant', content: 'Hi there!', refusal: null })
     expect(res.body.choices[0].finish_reason).toBe('stop')
   })
 
@@ -91,7 +91,10 @@ describe('POST /v1/chat/completions', () => {
       reqPromise,
       waitForPending(runner).then(() => runner.pending[0].resolve(outcome())),
     ])
-    expect(res.body.usage).toEqual({ prompt_tokens: 12, completion_tokens: 4, total_tokens: 16 })
+    expect(res.body.usage).toEqual({
+      prompt_tokens: 12, completion_tokens: 4, total_tokens: 16,
+      prompt_tokens_details: { cached_tokens: 10 },
+    })
   })
 
   it('passes the last message content, projectPath, model, and systemPrompt to the runner', async () => {
@@ -389,6 +392,225 @@ describe('POST /v1/chat/completions', () => {
     expect((await afterExit).status).toBe(200)
   })
 
+  describe('OpenAI API compatibility', () => {
+    it('includes refusal: null on the message and logprobs: null on the choice', async () => {
+      const runner = fakeRunner()
+      const { app } = appWith(runner)
+      const reqPromise = request(app).post('/v1/chat/completions').send({
+        sessionId: 's1', projectPath: '/app/workspace/proj', messages: [{ role: 'user', content: 'hi' }],
+      })
+      reqPromise.catch(() => {})
+      await waitForPending(runner)
+      runner.pending[0].resolve(outcome())
+      const res = await reqPromise
+      expect(res.body.choices[0].message).toEqual({ role: 'assistant', content: 'Hi there!', refusal: null })
+      expect(res.body.choices[0].logprobs).toBeNull()
+    })
+
+    it('includes usage.prompt_tokens_details.cached_tokens from cache_read_input_tokens', async () => {
+      const runner = fakeRunner()
+      const { app } = appWith(runner)
+      const reqPromise = request(app).post('/v1/chat/completions').send({
+        sessionId: 's1', projectPath: '/app/workspace/proj', messages: [{ role: 'user', content: 'hi' }],
+      })
+      reqPromise.catch(() => {})
+      await waitForPending(runner)
+      runner.pending[0].resolve(outcome())
+      const res = await reqPromise
+      expect(res.body.usage.prompt_tokens_details).toEqual({ cached_tokens: 10 })
+    })
+
+    it('treats a developer-role message the same as system for the prompt', async () => {
+      const runner = fakeRunner()
+      const { app } = appWith(runner)
+      const reqPromise = request(app).post('/v1/chat/completions').send({
+        sessionId: 's1', projectPath: '/app/workspace/proj',
+        messages: [{ role: 'developer', content: 'Be terse.' }, { role: 'user', content: 'hi' }],
+      })
+      reqPromise.catch(() => {})
+      await waitForPending(runner)
+      runner.pending[0].resolve(outcome())
+      await reqPromise
+      expect(runner.pending[0].opts.systemPrompt).toBe('Be terse.')
+    })
+
+    it('rejects a request with a non-empty tools array', async () => {
+      const runner = fakeRunner()
+      const { app } = appWith(runner)
+      const res = await request(app).post('/v1/chat/completions').send({
+        sessionId: 's1', projectPath: '/app/workspace/proj', tools: [{ type: 'function', function: { name: 'f' } }],
+        messages: [{ role: 'user', content: 'hi' }],
+      })
+      expect(res.status).toBe(400)
+      expect(res.body.error.type).toBe('invalid_request_error')
+    })
+
+    it('rejects a request with tool_choice other than "none"', async () => {
+      const runner = fakeRunner()
+      const { app } = appWith(runner)
+      const res = await request(app).post('/v1/chat/completions').send({
+        sessionId: 's1', projectPath: '/app/workspace/proj', tool_choice: 'auto',
+        messages: [{ role: 'user', content: 'hi' }],
+      })
+      expect(res.status).toBe(400)
+      expect(res.body.error.type).toBe('invalid_request_error')
+    })
+
+    it('rejects a request with a non-empty functions array (deprecated alias of tools)', async () => {
+      const runner = fakeRunner()
+      const { app } = appWith(runner)
+      const res = await request(app).post('/v1/chat/completions').send({
+        sessionId: 's1', projectPath: '/app/workspace/proj', functions: [{ name: 'f' }],
+        messages: [{ role: 'user', content: 'hi' }],
+      })
+      expect(res.status).toBe(400)
+      expect(res.body.error.type).toBe('invalid_request_error')
+    })
+
+    it('rejects a request with n greater than 1', async () => {
+      const runner = fakeRunner()
+      const { app } = appWith(runner)
+      const res = await request(app).post('/v1/chat/completions').send({
+        sessionId: 's1', projectPath: '/app/workspace/proj', n: 2, messages: [{ role: 'user', content: 'hi' }],
+      })
+      expect(res.status).toBe(400)
+      expect(res.body.error.type).toBe('invalid_request_error')
+    })
+
+    it('accepts n === 1 and sampling/other unsupported fields without error, ignoring them', async () => {
+      const runner = fakeRunner()
+      const { app } = appWith(runner)
+      const reqPromise = request(app).post('/v1/chat/completions').send({
+        sessionId: 's1', projectPath: '/app/workspace/proj', n: 1,
+        temperature: 0.7, top_p: 0.9, frequency_penalty: 0.1, presence_penalty: 0.1,
+        max_tokens: 100, max_completion_tokens: 100, seed: 42, user: 'u1', logit_bias: { 123: 1 },
+        messages: [{ role: 'user', content: 'hi' }],
+      })
+      reqPromise.catch(() => {})
+      await waitForPending(runner)
+      runner.pending[0].resolve(outcome())
+      const res = await reqPromise
+      expect(res.status).toBe(200)
+    })
+
+    it('maps reasoning_effort to the runner as effort when it is a CLI-supported level', async () => {
+      const runner = fakeRunner()
+      const { app } = appWith(runner)
+      const reqPromise = request(app).post('/v1/chat/completions').send({
+        sessionId: 's1', projectPath: '/app/workspace/proj', reasoning_effort: 'high',
+        messages: [{ role: 'user', content: 'hi' }],
+      })
+      reqPromise.catch(() => {})
+      await waitForPending(runner)
+      runner.pending[0].resolve(outcome())
+      await reqPromise
+      expect(runner.pending[0].opts.effort).toBe('high')
+    })
+
+    it('rejects reasoning_effort values the CLI does not support (e.g. "none")', async () => {
+      const runner = fakeRunner()
+      const { app } = appWith(runner)
+      const res = await request(app).post('/v1/chat/completions').send({
+        sessionId: 's1', projectPath: '/app/workspace/proj', reasoning_effort: 'none',
+        messages: [{ role: 'user', content: 'hi' }],
+      })
+      expect(res.status).toBe(400)
+      expect(res.body.error.type).toBe('invalid_request_error')
+    })
+
+    it('maps response_format json_schema to the runner as jsonSchema', async () => {
+      const runner = fakeRunner()
+      const { app } = appWith(runner)
+      const schema = { type: 'object', properties: { ok: { type: 'boolean' } } }
+      const reqPromise = request(app).post('/v1/chat/completions').send({
+        sessionId: 's1', projectPath: '/app/workspace/proj',
+        response_format: { type: 'json_schema', json_schema: { name: 'result', schema } },
+        messages: [{ role: 'user', content: 'hi' }],
+      })
+      reqPromise.catch(() => {})
+      await waitForPending(runner)
+      runner.pending[0].resolve(outcome())
+      await reqPromise
+      expect(runner.pending[0].opts.jsonSchema).toEqual(schema)
+    })
+
+    it('rejects response_format json_schema without a schema', async () => {
+      const runner = fakeRunner()
+      const { app } = appWith(runner)
+      const res = await request(app).post('/v1/chat/completions').send({
+        sessionId: 's1', projectPath: '/app/workspace/proj',
+        response_format: { type: 'json_schema', json_schema: { name: 'result' } },
+        messages: [{ role: 'user', content: 'hi' }],
+      })
+      expect(res.status).toBe(400)
+      expect(res.body.error.type).toBe('invalid_request_error')
+    })
+
+    it('ignores response_format type text/json_object as a no-op', async () => {
+      const runner = fakeRunner()
+      const { app } = appWith(runner)
+      const reqPromise = request(app).post('/v1/chat/completions').send({
+        sessionId: 's1', projectPath: '/app/workspace/proj', response_format: { type: 'json_object' },
+        messages: [{ role: 'user', content: 'hi' }],
+      })
+      reqPromise.catch(() => {})
+      await waitForPending(runner)
+      runner.pending[0].resolve(outcome())
+      await reqPromise
+      expect(runner.pending[0].opts.jsonSchema).toBeUndefined()
+    })
+
+    it('rejects a request with logprobs: true (the CLI has no logprob data to return)', async () => {
+      const runner = fakeRunner()
+      const { app } = appWith(runner)
+      const res = await request(app).post('/v1/chat/completions').send({
+        sessionId: 's1', projectPath: '/app/workspace/proj', logprobs: true,
+        messages: [{ role: 'user', content: 'hi' }],
+      })
+      expect(res.status).toBe(400)
+      expect(res.body.error.type).toBe('invalid_request_error')
+    })
+
+    it('accepts logprobs: false as a no-op', async () => {
+      const runner = fakeRunner()
+      const { app } = appWith(runner)
+      const reqPromise = request(app).post('/v1/chat/completions').send({
+        sessionId: 's1', projectPath: '/app/workspace/proj', logprobs: false,
+        messages: [{ role: 'user', content: 'hi' }],
+      })
+      reqPromise.catch(() => {})
+      await waitForPending(runner)
+      runner.pending[0].resolve(outcome())
+      const res = await reqPromise
+      expect(res.status).toBe(200)
+    })
+
+    it('rejects a request with a non-text modality (e.g. audio)', async () => {
+      const runner = fakeRunner()
+      const { app } = appWith(runner)
+      const res = await request(app).post('/v1/chat/completions').send({
+        sessionId: 's1', projectPath: '/app/workspace/proj', modalities: ['text', 'audio'],
+        messages: [{ role: 'user', content: 'hi' }],
+      })
+      expect(res.status).toBe(400)
+      expect(res.body.error.type).toBe('invalid_request_error')
+    })
+
+    it('accepts modalities: ["text"] as a no-op', async () => {
+      const runner = fakeRunner()
+      const { app } = appWith(runner)
+      const reqPromise = request(app).post('/v1/chat/completions').send({
+        sessionId: 's1', projectPath: '/app/workspace/proj', modalities: ['text'],
+        messages: [{ role: 'user', content: 'hi' }],
+      })
+      reqPromise.catch(() => {})
+      await waitForPending(runner)
+      runner.pending[0].resolve(outcome())
+      const res = await reqPromise
+      expect(res.status).toBe(200)
+    })
+  })
+
   describe('stream: true', () => {
     it('streams role, content deltas, and a final stop chunk terminated by [DONE]', async () => {
       const runner = fakeRunner()
@@ -412,7 +634,7 @@ describe('POST /v1/chat/completions', () => {
 
       expect(events[events.length - 1]).toBe('[DONE]')
       const chunks = events.slice(0, -1).map((e) => JSON.parse(e))
-      expect(chunks[0].choices[0].delta).toEqual({ role: 'assistant' })
+      expect(chunks[0].choices[0].delta).toEqual({ role: 'assistant', content: '' })
       expect(chunks[0].object).toBe('chat.completion.chunk')
       const contentChunks = chunks.filter((c) => c.choices[0]?.delta?.content)
       expect(contentChunks.map((c) => c.choices[0].delta.content)).toEqual(['Hi ', 'there!'])
@@ -441,7 +663,10 @@ describe('POST /v1/chat/completions', () => {
         .map((line) => JSON.parse(line))
 
       const usageChunk = chunks.find((c) => c.usage)
-      expect(usageChunk.usage).toEqual({ prompt_tokens: 12, completion_tokens: 4, total_tokens: 16 })
+      expect(usageChunk.usage).toEqual({
+        prompt_tokens: 12, completion_tokens: 4, total_tokens: 16,
+        prompt_tokens_details: { cached_tokens: 10 },
+      })
       expect(usageChunk.choices).toEqual([])
     })
 
@@ -460,7 +685,10 @@ describe('POST /v1/chat/completions', () => {
 
       const chunks = parseSseEvents(res.text).filter((l) => l !== '[DONE]').map((l) => JSON.parse(l))
       const usageChunk = chunks.find((c) => 'usage' in c)
-      expect(usageChunk.usage).toEqual({ prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 })
+      expect(usageChunk.usage).toEqual({
+        prompt_tokens: 0, completion_tokens: 0, total_tokens: 0,
+        prompt_tokens_details: { cached_tokens: 0 },
+      })
     })
 
     it('still returns a plain JSON 400 for an invalid streaming request', async () => {
