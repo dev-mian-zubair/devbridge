@@ -5,8 +5,9 @@ import { fileURLToPath } from 'node:url'
 import { WebSocketServer } from 'ws'
 import * as pty from 'node-pty'
 import { loadConfig } from './config.js'
-import { createSessionManager } from './sessionManager.js'
+import { createLoginSession } from './loginSession.js'
 import { createTurnSessions } from './turnSessions.js'
+import { createTurnEvents } from './turnEvents.js'
 import { createClaudeCliRunner } from './claudeCliRunner.js'
 import { createChatCompletionsRouter } from './routes/chatCompletions.js'
 import { createModelsRouter } from './routes/models.js'
@@ -76,48 +77,30 @@ function createIsAllowedOrigin(trustedHostnames) {
   }
 }
 
-export function createApp(sessionManager, turnSessions, runner, { timeoutMs = 120000, trustedHosts = [] } = {}) {
+export function createApp({ turnSessions, runner, events, timeoutMs = 120000, trustedHosts = [] } = {}) {
   const app = express()
   app.use(createSameOriginOnly(buildTrustedHostnames(trustedHosts)))
   app.use(express.json())
   app.use(express.static(publicDir))
 
-  // The dashboard's live debug terminal is a separate concern from the chat
-  // completions API below: it drives the interactive PTY session directly
-  // (see src/ws/sessionStream.js) so a human can watch and type into the
-  // real CLI, independent of the API's own per-turn session bookkeeping.
-  app.post('/api/sessions', async (req, res) => {
-    const { sessionId, projectPath } = req.body ?? {}
-    if (typeof sessionId !== 'string' || sessionId.length === 0) {
-      return res.status(400).json({ error: { message: 'sessionId is required', type: 'invalid_request_error' } })
-    }
-    try {
-      await sessionManager.getOrCreate(sessionId, projectPath)
-      return res.status(204).end()
-    } catch (err) {
-      if (err.name === 'SessionConflictError') {
-        return res.status(409).json({ error: { message: err.message, type: 'session_conflict' } })
-      }
-      if (err.name === 'InvalidProjectPathError') {
-        return res.status(400).json({ error: { message: err.message, type: 'invalid_project_path' } })
-      }
-      return res.status(500).json({ error: { message: 'internal error', type: 'server_error' } })
-    }
-  })
-
   app.use(createModelsRouter())
-  app.use(createChatCompletionsRouter({ sessions: turnSessions, runner, timeoutMs }))
+  app.use(createChatCompletionsRouter({ sessions: turnSessions, runner, timeoutMs, events }))
   return app
 }
 
 export function createServer(config, spawnFn) {
-  const sessionManager = createSessionManager(spawnFn, {
+  const events = createTurnEvents()
+  const turnSessions = createTurnSessions(undefined, events)
+  const loginSession = createLoginSession(spawnFn, {
     readinessTimeoutMs: config.readinessTimeoutMs,
     readinessSettleMs: config.readinessSettleMs,
+    claudeConfigDir: config.claudeConfigDir,
   })
-  const turnSessions = createTurnSessions()
   const runner = createClaudeCliRunner()
-  const app = createApp(sessionManager, turnSessions, runner, {
+  const app = createApp({
+    turnSessions,
+    runner,
+    events,
     timeoutMs: config.execTimeoutMs,
     trustedHosts: config.trustedHosts,
   })
@@ -127,7 +110,7 @@ export function createServer(config, spawnFn) {
     path: '/api/session/stream',
     verifyClient: createIsAllowedOrigin(buildTrustedHostnames(config.trustedHosts)),
   })
-  wss.on('connection', createSessionStreamHandler(sessionManager))
+  wss.on('connection', createSessionStreamHandler({ turnSessions, events, loginSession }))
   return { app, httpServer, wss }
 }
 

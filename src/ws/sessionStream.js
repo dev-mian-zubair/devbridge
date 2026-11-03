@@ -1,80 +1,62 @@
-// TIOCSWINSZ's winsize struct fields are unsigned 16-bit, so anything above
-// 65535 wraps to an unrelated value instead of erroring; these bounds are
-// also just how large a real terminal panel could plausibly be, so a huge
-// client-supplied size is rejected well below the wrap point, not clamped
-// up to it.
-const MAX_COLS = 500
-const MAX_ROWS = 300
-
-export function createSessionStreamHandler(sessionManager) {
+// The dashboard's WS connection serves two unrelated purposes: a live feed
+// of turnSessions activity (snapshot on connect, then every session:update
+// / session:delta the chat-completions route and turnSessions publish —
+// see src/turnEvents.js), and driving the single, dedicated login PTY
+// (src/loginSession.js) through its own login:* frames. Neither purpose
+// needs — or gets — a faithfully rendered terminal: the observability feed
+// is plain assistant text, and the login flow only needs a URL/code
+// extracted from raw output, not a real screen.
+export function createSessionStreamHandler({ turnSessions, events, loginSession }) {
   return (ws, _request) => {
-    const disposables = new Map()
+    let startedLogin = false
 
-    ws.on('message', (raw) => {
+    ws.send(JSON.stringify({ type: 'snapshot', sessions: turnSessions.list() }))
+    const unsubscribe = events.subscribe((message) => {
+      ws.send(JSON.stringify(message))
+    })
+
+    ws.on('message', async (raw) => {
       let frame
       try {
         frame = JSON.parse(raw)
       } catch {
-        ws.send(JSON.stringify({ type: 'error', sessionId: null, data: 'invalid frame' }))
+        ws.send(JSON.stringify({ type: 'error', data: 'invalid frame' }))
         return
       }
 
-      const { type, sessionId, data, cols, rows } = frame ?? {}
+      const { type, data } = frame ?? {}
 
-      // The PTY is spawned at a fixed size before the browser's xterm.js
-      // instance has ever reported its own — without this, the CLI's
-      // full-screen TUI positions its cursor assuming a terminal width
-      // that doesn't match what's actually rendered, producing garbled
-      // output. The client sends its real size once it knows it (after
-      // fitting to its container) and on every resize after that.
-      if (type === 'resize') {
-        if (
-          typeof sessionId !== 'string' ||
-          !Number.isInteger(cols) || !Number.isInteger(rows) ||
-          cols <= 0 || rows <= 0 || cols > MAX_COLS || rows > MAX_ROWS
-        ) {
-          ws.send(JSON.stringify({ type: 'error', sessionId: sessionId ?? null, data: 'invalid frame' }))
-          return
-        }
-        const session = sessionManager.get(sessionId)
-        if (!session) {
-          ws.send(JSON.stringify({ type: 'error', sessionId, data: 'unknown session' }))
-          return
-        }
-        try {
-          session.pty.resize(cols, rows)
-        } catch {
-          ws.send(JSON.stringify({ type: 'error', sessionId, data: 'resize failed' }))
-        }
-        return
-      }
-
-      if (type !== 'input' || typeof sessionId !== 'string' || typeof data !== 'string') {
-        ws.send(JSON.stringify({ type: 'error', sessionId: sessionId ?? null, data: 'invalid frame' }))
-        return
-      }
-
-      const session = sessionManager.get(sessionId)
-      if (!session) {
-        ws.send(JSON.stringify({ type: 'error', sessionId, data: 'unknown session' }))
-        return
-      }
-
-      if (!disposables.has(sessionId)) {
-        const disposable = session.pty.onData((chunk) => {
-          ws.send(JSON.stringify({ type: 'output', sessionId, data: chunk }))
+      if (type === 'login:start') {
+        startedLogin = true
+        await loginSession.start((chunk) => {
+          ws.send(JSON.stringify({ type: 'login:output', data: chunk }))
         })
-        disposables.set(sessionId, disposable)
+        return
       }
 
-      session.pty.write(data)
+      if (type === 'login:input') {
+        if (typeof data !== 'string') {
+          ws.send(JSON.stringify({ type: 'error', data: 'invalid frame' }))
+          return
+        }
+        loginSession.input(data)
+        return
+      }
+
+      if (type === 'login:complete') {
+        loginSession.dispose()
+        return
+      }
+
+      ws.send(JSON.stringify({ type: 'error', data: 'invalid frame' }))
     })
 
     ws.on('close', () => {
-      for (const disposable of disposables.values()) {
-        disposable?.dispose?.()
-      }
-      disposables.clear()
+      unsubscribe()
+      // A dashboard tab closing mid-login is exactly the abandonment case
+      // the login session's own GC timeout is a backstop for — disposing
+      // here handles the common case immediately instead of waiting it out.
+      if (startedLogin) loginSession.dispose()
     })
   }
 }

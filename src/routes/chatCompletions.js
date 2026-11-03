@@ -166,7 +166,7 @@ function noRetry(res) {
   res.set('x-should-retry', 'false')
 }
 
-export function createChatCompletionsRouter({ sessions, runner, timeoutMs }) {
+export function createChatCompletionsRouter({ sessions, runner, timeoutMs, events }) {
   const router = Router()
   const busySessions = new Set()
 
@@ -209,6 +209,8 @@ export function createChatCompletionsRouter({ sessions, runner, timeoutMs }) {
       })
     }
     busySessions.add(sessionId)
+    sessions.recordRequestStart(sessionId, { model: model ?? null, messageCount: req.body.messages.length, lastUserMessage: content })
+    const publishDelta = (text) => events.publish({ type: 'session:delta', sessionId, text })
 
     const id = `chatcmpl-local-${sessionId}-${Date.now()}`
     const created = Math.floor(Date.now() / 1000)
@@ -228,6 +230,7 @@ export function createChatCompletionsRouter({ sessions, runner, timeoutMs }) {
         ...runTurnOpts,
         onDelta: (text) => {
           sseWrite(res, { id, object: 'chat.completion.chunk', created, model: model ?? 'claude-code-local', choices: [{ index: 0, delta: { content: text }, finish_reason: null, logprobs: null }] })
+          publishDelta(text)
         },
       })
       // The lock is released once the underlying process has actually
@@ -250,6 +253,7 @@ export function createChatCompletionsRouter({ sessions, runner, timeoutMs }) {
 
         if (result.isError) {
           sseWrite(res, { id, error: { message: result.text || 'the assistant turn ended in an error', type: 'assistant_error', code: result.subtype } })
+          sessions.recordError(sessionId, { message: result.text || 'the assistant turn ended in an error', code: result.subtype })
         } else {
           sseWrite(res, {
             id, object: 'chat.completion.chunk', created, model: result.model ?? model ?? 'claude-code-local',
@@ -258,6 +262,7 @@ export function createChatCompletionsRouter({ sessions, runner, timeoutMs }) {
           if (req.body.stream_options?.include_usage) {
             sseWrite(res, { id, object: 'chat.completion.chunk', created, model: result.model ?? model ?? 'claude-code-local', choices: [], usage: mapUsage(result.usage) })
           }
+          sessions.recordResult(sessionId, { content: result.text, finishReason: mapFinishReason(result.stopReason), usage: mapUsage(result.usage) })
         }
       } catch (err) {
         // Headers are already committed to text/event-stream at this point,
@@ -265,6 +270,7 @@ export function createChatCompletionsRouter({ sessions, runner, timeoutMs }) {
         // equivalent is an error-shaped chunk before the stream ends, which
         // is what the OpenAI SDKs look for to raise APIError from a stream.
         sseWrite(res, { id, error: { message: err.message, type: err.message === 'timeout' ? 'timeout' : 'server_error' } })
+        sessions.recordError(sessionId, { message: err.message, code: err.message === 'timeout' ? 'timeout' : 'server_error' })
       } finally {
         res.off('close', kill)
       }
@@ -273,7 +279,7 @@ export function createChatCompletionsRouter({ sessions, runner, timeoutMs }) {
       return
     }
 
-    const { promise: rawPromise, kill } = runner.runTurn(runTurnOpts)
+    const { promise: rawPromise, kill } = runner.runTurn({ ...runTurnOpts, onDelta: publishDelta })
     rawPromise.catch(() => {}).finally(() => busySessions.delete(sessionId))
     res.on('close', kill)
 
@@ -283,11 +289,13 @@ export function createChatCompletionsRouter({ sessions, runner, timeoutMs }) {
 
       if (result.isError) {
         noRetry(res)
+        sessions.recordError(sessionId, { message: result.text || 'the assistant turn ended in an error', code: result.subtype })
         return res.status(500).json({
           error: { message: result.text || 'the assistant turn ended in an error', type: 'assistant_error', code: result.subtype },
         })
       }
 
+      sessions.recordResult(sessionId, { content: result.text, finishReason: mapFinishReason(result.stopReason), usage: mapUsage(result.usage) })
       return res.json({
         id,
         object: 'chat.completion',
@@ -305,10 +313,12 @@ export function createChatCompletionsRouter({ sessions, runner, timeoutMs }) {
       })
     } catch (err) {
       if (err.message === 'timeout') {
+        sessions.recordError(sessionId, { message: 'timed out waiting for a response', code: 'timeout' })
         return res.status(504).json({
           error: { message: 'timed out waiting for a response', type: 'timeout' },
         })
       }
+      sessions.recordError(sessionId, { message: err.message, code: 'server_error' })
       return res.status(500).json({ error: { message: err.message, type: 'server_error' } })
     } finally {
       res.off('close', kill)

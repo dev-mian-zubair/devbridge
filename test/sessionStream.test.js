@@ -1,170 +1,122 @@
 import { describe, it, expect, vi } from 'vitest'
 import { createSessionStreamHandler } from '../src/ws/sessionStream.js'
-import { createSessionManager } from '../src/sessionManager.js'
 
 function fakeWs() { return { send: vi.fn(), on: vi.fn() } }
 
-// projectPath in these tests is a fixture string, not a real directory on
-// this test host (unlike inside the container), so the real fs.statSync
-// default is swapped for one that treats any path as valid.
-const FAKE_STAT = { statFn: () => ({ isDirectory: () => true }) }
+function fakeTurnSessions(sessions = []) {
+  return { list: vi.fn(() => sessions) }
+}
 
-// getOrCreate() now does its own internal onData() registration (the
-// readiness wait) before resolving, separate from any listener the WS
-// handler itself registers afterward — each onData() call here gets its
-// own disposable so a test can target the specific registration it cares
-// about via lastDisposeSpy(), not conflate it with the readiness one.
-function fakePtyFactory() {
-  let dataCb
-  const disposeSpies = []
+function fakeEvents() {
+  let listener = null
   return {
-    spawnFn: vi.fn(() => ({
-      write: vi.fn(),
-      resize: vi.fn(),
-      onData: (cb) => {
-        dataCb = cb
-        const spy = vi.fn()
-        disposeSpies.push(spy)
-        return { dispose: spy }
-      },
-      onExit: vi.fn(),
-      kill: vi.fn(),
-    })),
-    trigger: (chunk) => dataCb(chunk),
-    lastDisposeSpy: () => disposeSpies[disposeSpies.length - 1],
+    subscribe: vi.fn((cb) => { listener = cb; return vi.fn() }),
+    emit: (message) => listener?.(message),
   }
 }
 
+function fakeLoginSession() {
+  return { start: vi.fn(async () => {}), input: vi.fn(), dispose: vi.fn(), isActive: vi.fn(() => false) }
+}
+
+function wire(ws, turnSessions, events, loginSession) {
+  const handler = createSessionStreamHandler({ turnSessions, events, loginSession })
+  handler(ws, {})
+  const onMessage = ws.on.mock.calls.find(([event]) => event === 'message')[1]
+  const onClose = ws.on.mock.calls.find(([event]) => event === 'close')?.[1]
+  return { onMessage, onClose }
+}
+
 describe('createSessionStreamHandler', () => {
-  it('writes inbound input data to the matching session PTY', async () => {
-    const { spawnFn } = fakePtyFactory()
-    const sessionManager = createSessionManager(spawnFn, FAKE_STAT)
-    const session = await sessionManager.getOrCreate('s1', '/app/workspace/proj')
+  it('sends a snapshot of turnSessions.list() immediately on connect', () => {
     const ws = fakeWs()
-    const handler = createSessionStreamHandler(sessionManager)
-    handler(ws, {})
-    const onMessage = ws.on.mock.calls.find(([event]) => event === 'message')[1]
-    onMessage(JSON.stringify({ type: 'input', sessionId: 's1', data: '/login\n' }))
-    expect(session.pty.write).toHaveBeenCalledWith('/login\n')
+    const sessions = [{ sessionId: 's1', projectPath: '/p', status: 'idle' }]
+    wire(ws, fakeTurnSessions(sessions), fakeEvents(), fakeLoginSession())
+    expect(ws.send).toHaveBeenCalledWith(JSON.stringify({ type: 'snapshot', sessions }))
   })
 
-  it('forwards PTY output as an outbound output frame', async () => {
-    const { spawnFn, trigger } = fakePtyFactory()
-    const sessionManager = createSessionManager(spawnFn, FAKE_STAT)
-    await sessionManager.getOrCreate('s1', '/app/workspace/proj')
+  it('forwards every message published on the shared event bus to the socket', () => {
     const ws = fakeWs()
-    const handler = createSessionStreamHandler(sessionManager)
-    handler(ws, {})
-    const onMessage = ws.on.mock.calls.find(([event]) => event === 'message')[1]
-    onMessage(JSON.stringify({ type: 'input', sessionId: 's1', data: 'x' }))
-    trigger('some terminal output')
-    expect(ws.send).toHaveBeenCalledWith(JSON.stringify({ type: 'output', sessionId: 's1', data: 'some terminal output' }))
+    const events = fakeEvents()
+    wire(ws, fakeTurnSessions(), events, fakeLoginSession())
+    events.emit({ type: 'session:update', session: { sessionId: 's1' } })
+    expect(ws.send).toHaveBeenCalledWith(JSON.stringify({ type: 'session:update', session: { sessionId: 's1' } }))
   })
 
-  it('sends an error frame for an unknown sessionId instead of throwing', () => {
-    const sessionManager = createSessionManager(vi.fn())
+  it('login:start starts the login session with a callback that forwards output as login:output', async () => {
     const ws = fakeWs()
-    const handler = createSessionStreamHandler(sessionManager)
-    handler(ws, {})
-    const onMessage = ws.on.mock.calls.find(([event]) => event === 'message')[1]
-    expect(() => onMessage(JSON.stringify({ type: 'input', sessionId: 'missing', data: 'x' }))).not.toThrow()
-    expect(ws.send).toHaveBeenCalledWith(JSON.stringify({ type: 'error', sessionId: 'missing', data: 'unknown session' }))
+    const loginSession = fakeLoginSession()
+    const { onMessage } = wire(ws, fakeTurnSessions(), fakeEvents(), loginSession)
+    await onMessage(JSON.stringify({ type: 'login:start' }))
+    expect(loginSession.start).toHaveBeenCalledTimes(1)
+    const onOutput = loginSession.start.mock.calls[0][0]
+    onOutput('visit https://example.com')
+    expect(ws.send).toHaveBeenCalledWith(JSON.stringify({ type: 'login:output', data: 'visit https://example.com' }))
   })
 
-  it('sends an error frame for malformed JSON instead of throwing', () => {
-    const sessionManager = createSessionManager(vi.fn())
+  it('login:input forwards its data to loginSession.input', async () => {
     const ws = fakeWs()
-    const handler = createSessionStreamHandler(sessionManager)
-    handler(ws, {})
-    const onMessage = ws.on.mock.calls.find(([event]) => event === 'message')[1]
-    expect(() => onMessage('not json {')).not.toThrow()
-    expect(ws.send).toHaveBeenCalledWith(JSON.stringify({ type: 'error', sessionId: null, data: 'invalid frame' }))
+    const loginSession = fakeLoginSession()
+    const { onMessage } = wire(ws, fakeTurnSessions(), fakeEvents(), loginSession)
+    await onMessage(JSON.stringify({ type: 'login:input', data: 'pasted-code\r' }))
+    expect(loginSession.input).toHaveBeenCalledWith('pasted-code\r')
   })
 
-  it('sends an error frame for a frame with a non-string data field instead of throwing', async () => {
-    const { spawnFn } = fakePtyFactory()
-    const sessionManager = createSessionManager(spawnFn, FAKE_STAT)
-    await sessionManager.getOrCreate('s1', '/app/workspace/proj')
+  it('login:input with non-string data sends an error frame instead of forwarding it', async () => {
     const ws = fakeWs()
-    const handler = createSessionStreamHandler(sessionManager)
-    handler(ws, {})
-    const onMessage = ws.on.mock.calls.find(([event]) => event === 'message')[1]
-    expect(() => onMessage(JSON.stringify({ type: 'input', sessionId: 's1', data: 42 }))).not.toThrow()
-    expect(ws.send).toHaveBeenCalledWith(JSON.stringify({ type: 'error', sessionId: 's1', data: 'invalid frame' }))
+    const loginSession = fakeLoginSession()
+    const { onMessage } = wire(ws, fakeTurnSessions(), fakeEvents(), loginSession)
+    await onMessage(JSON.stringify({ type: 'login:input', data: 42 }))
+    expect(loginSession.input).not.toHaveBeenCalled()
+    expect(ws.send).toHaveBeenCalledWith(JSON.stringify({ type: 'error', data: 'invalid frame' }))
   })
 
-  it('resizes the matching session PTY on a resize frame', async () => {
-    const { spawnFn } = fakePtyFactory()
-    const sessionManager = createSessionManager(spawnFn, FAKE_STAT)
-    const session = await sessionManager.getOrCreate('s1', '/app/workspace/proj')
+  it('login:complete disposes the login session', async () => {
     const ws = fakeWs()
-    const handler = createSessionStreamHandler(sessionManager)
-    handler(ws, {})
-    const onMessage = ws.on.mock.calls.find(([event]) => event === 'message')[1]
-    onMessage(JSON.stringify({ type: 'resize', sessionId: 's1', cols: 100, rows: 30 }))
-    expect(session.pty.resize).toHaveBeenCalledWith(100, 30)
+    const loginSession = fakeLoginSession()
+    const { onMessage } = wire(ws, fakeTurnSessions(), fakeEvents(), loginSession)
+    await onMessage(JSON.stringify({ type: 'login:complete' }))
+    expect(loginSession.dispose).toHaveBeenCalledTimes(1)
   })
 
-  it('sends an error frame for a resize frame with non-integer cols/rows instead of throwing', async () => {
-    const { spawnFn } = fakePtyFactory()
-    const sessionManager = createSessionManager(spawnFn, FAKE_STAT)
-    await sessionManager.getOrCreate('s1', '/app/workspace/proj')
+  it('sends an error frame for malformed JSON instead of throwing', async () => {
     const ws = fakeWs()
-    const handler = createSessionStreamHandler(sessionManager)
-    handler(ws, {})
-    const onMessage = ws.on.mock.calls.find(([event]) => event === 'message')[1]
-    expect(() => onMessage(JSON.stringify({ type: 'resize', sessionId: 's1', cols: 'wide', rows: 30 }))).not.toThrow()
-    expect(ws.send).toHaveBeenCalledWith(JSON.stringify({ type: 'error', sessionId: 's1', data: 'invalid frame' }))
+    const { onMessage } = wire(ws, fakeTurnSessions(), fakeEvents(), fakeLoginSession())
+    await expect(onMessage('not json')).resolves.not.toThrow()
+    expect(ws.send).toHaveBeenCalledWith(JSON.stringify({ type: 'error', data: 'invalid frame' }))
   })
 
-  it('sends an error frame for a resize frame with cols/rows above the sane upper bound, without ever calling resize', async () => {
-    const { spawnFn } = fakePtyFactory()
-    const sessionManager = createSessionManager(spawnFn, FAKE_STAT)
-    const session = await sessionManager.getOrCreate('s1', '/app/workspace/proj')
+  it('sends an error frame for an unknown frame type', async () => {
     const ws = fakeWs()
-    const handler = createSessionStreamHandler(sessionManager)
-    handler(ws, {})
-    const onMessage = ws.on.mock.calls.find(([event]) => event === 'message')[1]
-    expect(() => onMessage(JSON.stringify({ type: 'resize', sessionId: 's1', cols: 100000, rows: 30 }))).not.toThrow()
-    expect(ws.send).toHaveBeenCalledWith(JSON.stringify({ type: 'error', sessionId: 's1', data: 'invalid frame' }))
-    expect(session.pty.resize).not.toHaveBeenCalled()
+    const { onMessage } = wire(ws, fakeTurnSessions(), fakeEvents(), fakeLoginSession())
+    await onMessage(JSON.stringify({ type: 'nonsense' }))
+    expect(ws.send).toHaveBeenCalledWith(JSON.stringify({ type: 'error', data: 'invalid frame' }))
   })
 
-  it('sends an error frame instead of throwing when pty.resize itself throws', async () => {
-    const { spawnFn } = fakePtyFactory()
-    const sessionManager = createSessionManager(spawnFn, FAKE_STAT)
-    const session = await sessionManager.getOrCreate('s1', '/app/workspace/proj')
-    session.pty.resize.mockImplementation(() => { throw new Error('ioctl failed') })
+  it('disposes the login session on close if this connection started one', async () => {
     const ws = fakeWs()
-    const handler = createSessionStreamHandler(sessionManager)
-    handler(ws, {})
-    const onMessage = ws.on.mock.calls.find(([event]) => event === 'message')[1]
-    expect(() => onMessage(JSON.stringify({ type: 'resize', sessionId: 's1', cols: 100, rows: 30 }))).not.toThrow()
-    expect(ws.send).toHaveBeenCalledWith(JSON.stringify({ type: 'error', sessionId: 's1', data: 'resize failed' }))
-  })
-
-  it('sends an error frame for a resize frame targeting an unknown sessionId', () => {
-    const sessionManager = createSessionManager(vi.fn())
-    const ws = fakeWs()
-    const handler = createSessionStreamHandler(sessionManager)
-    handler(ws, {})
-    const onMessage = ws.on.mock.calls.find(([event]) => event === 'message')[1]
-    onMessage(JSON.stringify({ type: 'resize', sessionId: 'missing', cols: 100, rows: 30 }))
-    expect(ws.send).toHaveBeenCalledWith(JSON.stringify({ type: 'error', sessionId: 'missing', data: 'unknown session' }))
-  })
-
-  it('disposes all subscribed PTY data listeners when the socket closes', async () => {
-    const { spawnFn, lastDisposeSpy } = fakePtyFactory()
-    const sessionManager = createSessionManager(spawnFn, FAKE_STAT)
-    await sessionManager.getOrCreate('s1', '/app/workspace/proj')
-    const ws = fakeWs()
-    const handler = createSessionStreamHandler(sessionManager)
-    handler(ws, {})
-    const onMessage = ws.on.mock.calls.find(([event]) => event === 'message')[1]
-    onMessage(JSON.stringify({ type: 'input', sessionId: 's1', data: 'x' }))
-    const wsListenerDisposeSpy = lastDisposeSpy()
-    const onClose = ws.on.mock.calls.find(([event]) => event === 'close')[1]
+    const loginSession = fakeLoginSession()
+    const { onMessage, onClose } = wire(ws, fakeTurnSessions(), fakeEvents(), loginSession)
+    await onMessage(JSON.stringify({ type: 'login:start' }))
     onClose()
-    expect(wsListenerDisposeSpy).toHaveBeenCalledTimes(1)
+    expect(loginSession.dispose).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not dispose the login session on close if this connection never started one', () => {
+    const ws = fakeWs()
+    const loginSession = fakeLoginSession()
+    const { onClose } = wire(ws, fakeTurnSessions(), fakeEvents(), loginSession)
+    onClose()
+    expect(loginSession.dispose).not.toHaveBeenCalled()
+  })
+
+  it('unsubscribes from the event bus on close', () => {
+    const ws = fakeWs()
+    const events = fakeEvents()
+    const unsubscribe = vi.fn()
+    events.subscribe = vi.fn(() => unsubscribe)
+    const { onClose } = wire(ws, fakeTurnSessions(), events, fakeLoginSession())
+    onClose()
+    expect(unsubscribe).toHaveBeenCalledTimes(1)
   })
 })

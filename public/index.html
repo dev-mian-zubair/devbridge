@@ -4,47 +4,46 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>DevBridge</title>
-  <link
-    rel="stylesheet"
-    href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css"
-    integrity="sha384-LJcOxlx9IMbNXDqJ2axpfEQKkAYbFjJfhXexLfiRJhjDU81mzgkiQq8rkV0j6dVh"
-    crossorigin="anonymous"
-  />
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
-  <header id="status-bar" class="status-bar">Status: unknown</header>
+  <header id="status-bar" class="status-bar">Status: connecting&hellip;</header>
 
   <div class="layout">
     <aside class="navigator">
-      <h2>Sessions</h2>
-      <ul id="session-list"></ul>
-
-      <form id="add-session-form">
-        <input id="session-id-input" type="text" placeholder="sessionId" required />
-        <input id="project-path-input" type="text" placeholder="/app/workspace/project" required />
-        <button type="submit">Add session</button>
-      </form>
-
-      <button id="auth-button" type="button">Sign In</button>
-      <div id="auth-link" hidden></div>
+      <h2>Projects</h2>
+      <div id="project-tree"></div>
+      <button id="sign-in-button" type="button">Sign In</button>
     </aside>
 
     <main>
-      <div id="terminal"></div>
+      <div id="session-detail" class="empty">Select a session to view its activity.</div>
     </main>
   </div>
 
-  <script
-    src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"
-    integrity="sha384-/nfmYPUzWMS6v2atn8hbljz7NE0EI1iGx34lJaNzyVjWGDzMv+ciUZUeJpKA3Glc"
-    crossorigin="anonymous"
-  ></script>
-  <script
-    src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"
-    integrity="sha384-AQLWHRKAgdTxkolJcLOELg4E9rE89CPE2xMy3tIRFn08NcGKPTsELdvKomqji+DL"
-    crossorigin="anonymous"
-  ></script>
+  <div id="login-overlay" class="login-overlay" hidden>
+    <div class="login-panel">
+      <h3>Sign in</h3>
+      <p id="login-status">Starting&hellip;</p>
+
+      <div id="login-link-area" hidden>
+        <a id="login-url-link" target="_blank" rel="noopener noreferrer"></a>
+      </div>
+
+      <pre id="login-raw-output" class="login-raw-output"></pre>
+
+      <div class="login-input-row">
+        <input id="login-input-field" type="text" placeholder="Type or paste a response, then press Enter" />
+        <button id="login-send-button" type="button">Send</button>
+      </div>
+
+      <div class="login-actions">
+        <button id="login-signed-in-button" type="button">I'm signed in</button>
+        <button id="login-cancel-button" type="button">Close</button>
+      </div>
+    </div>
+  </div>
+
   <script type="module" src="app.js"></script>
 </body>
 </html>

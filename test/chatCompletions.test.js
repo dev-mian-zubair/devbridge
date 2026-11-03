@@ -4,6 +4,7 @@ import express from 'express'
 import request from 'supertest'
 import { createChatCompletionsRouter } from '../src/routes/chatCompletions.js'
 import { createTurnSessions } from '../src/turnSessions.js'
+import { createTurnEvents } from '../src/turnEvents.js'
 
 // kill() here is a plain spy, not an auto-reject: a real killed process
 // takes a moment to actually exit, and tests that care about that gap
@@ -52,11 +53,15 @@ function outcome(overrides = {}) {
   }
 }
 
-function appWith(runner, { timeoutMs = 1000, sessions = createTurnSessions(() => ({ isDirectory: () => true })) } = {}) {
+function appWith(runner, {
+  timeoutMs = 1000,
+  events = createTurnEvents(),
+  sessions = createTurnSessions(() => ({ isDirectory: () => true }), events),
+} = {}) {
   const app = express()
   app.use(express.json())
-  app.use(createChatCompletionsRouter({ sessions, runner, timeoutMs }))
-  return { app, sessions }
+  app.use(createChatCompletionsRouter({ sessions, runner, timeoutMs, events }))
+  return { app, sessions, events }
 }
 
 async function waitForPending(runner, count = 1) {
@@ -608,6 +613,71 @@ describe('POST /v1/chat/completions', () => {
       runner.pending[0].resolve(outcome())
       const res = await reqPromise
       expect(res.status).toBe(200)
+    })
+  })
+
+  describe('observability: turnSessions status and turnEvents', () => {
+    it('records a running status and request summary on turnSessions once a turn starts', async () => {
+      const runner = fakeRunner()
+      const { app, sessions } = appWith(runner)
+      const reqPromise = request(app).post('/v1/chat/completions').send({
+        sessionId: 's1', projectPath: '/app/workspace/proj', model: 'opus',
+        messages: [{ role: 'user', content: 'hi' }],
+      })
+      reqPromise.catch(() => {})
+      await waitForPending(runner)
+      expect(sessions.get('s1').status).toBe('running')
+      expect(sessions.get('s1').lastRequest).toEqual({ model: 'opus', messageCount: 1, lastUserMessage: 'hi' })
+      runner.pending[0].resolve(outcome())
+      await reqPromise
+    })
+
+    it('records the result on turnSessions once a turn completes successfully', async () => {
+      const runner = fakeRunner()
+      const { app, sessions } = appWith(runner)
+      const reqPromise = request(app).post('/v1/chat/completions').send({
+        sessionId: 's1', projectPath: '/app/workspace/proj', messages: [{ role: 'user', content: 'hi' }],
+      })
+      reqPromise.catch(() => {})
+      await waitForPending(runner)
+      runner.pending[0].resolve(outcome())
+      await reqPromise
+      const session = sessions.get('s1')
+      expect(session.status).toBe('idle')
+      expect(session.lastResult.content).toBe('Hi there!')
+      expect(session.lastResult.finishReason).toBe('stop')
+    })
+
+    it('records an error on turnSessions when the turn ends in an assistant error', async () => {
+      const runner = fakeRunner()
+      const { app, sessions } = appWith(runner)
+      const reqPromise = request(app).post('/v1/chat/completions').send({
+        sessionId: 's1', projectPath: '/app/workspace/proj', messages: [{ role: 'user', content: 'hi' }],
+      })
+      reqPromise.catch(() => {})
+      await waitForPending(runner)
+      runner.pending[0].resolve(outcome({ isError: true, text: 'denied' }))
+      await reqPromise
+      const session = sessions.get('s1')
+      expect(session.status).toBe('error')
+      expect(session.lastError.message).toBe('denied')
+    })
+
+    it('publishes session:delta events as the turn streams, even for a non-streaming request', async () => {
+      const runner = fakeRunner()
+      const events = createTurnEvents()
+      const listener = vi.fn()
+      events.subscribe(listener)
+      const { app } = appWith(runner, { events })
+      const reqPromise = request(app).post('/v1/chat/completions').send({
+        sessionId: 's1', projectPath: '/app/workspace/proj', messages: [{ role: 'user', content: 'hi' }],
+      })
+      reqPromise.catch(() => {})
+      await waitForPending(runner)
+      runner.pending[0].opts.onDelta('Hi ')
+      runner.pending[0].resolve(outcome())
+      await reqPromise
+      expect(listener).toHaveBeenCalledWith({ type: 'session:delta', sessionId: 's1', text: 'Hi ' })
     })
   })
 

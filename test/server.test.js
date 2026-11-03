@@ -20,41 +20,6 @@ describe('createServer', () => {
     expect(res.status).not.toBe(404)
   })
 
-  describe('POST /api/sessions', () => {
-    it('creates the PTY session the debug terminal will attach to', async () => {
-      const pty = { write: vi.fn(), onData: vi.fn(), onExit: vi.fn(), kill: vi.fn() }
-      const spawnFn = vi.fn(() => pty)
-      const { app } = createServer({ port: 0, host: '127.0.0.1', execTimeoutMs: 1000 }, spawnFn)
-      const res = await request(app).post('/api/sessions').send({ sessionId: 's1', projectPath: process.cwd() })
-      expect(res.status).toBe(204)
-      expect(spawnFn).toHaveBeenCalledTimes(1)
-    })
-
-    it('returns 400 for a missing sessionId', async () => {
-      const { app } = createServer({ port: 0, host: '127.0.0.1', execTimeoutMs: 1000 }, vi.fn())
-      const res = await request(app).post('/api/sessions').send({ projectPath: '/app/workspace/proj' })
-      expect(res.status).toBe(400)
-      expect(res.body.error.type).toBe('invalid_request_error')
-    })
-
-    it('returns 400 for an invalid projectPath', async () => {
-      const { app } = createServer({ port: 0, host: '127.0.0.1', execTimeoutMs: 1000 }, vi.fn())
-      const res = await request(app).post('/api/sessions').send({ sessionId: 's1', projectPath: 'relative' })
-      expect(res.status).toBe(400)
-      expect(res.body.error.type).toBe('invalid_project_path')
-    })
-
-    it('returns 409 when the sessionId is already bound to a different projectPath', async () => {
-      const pty = { write: vi.fn(), onData: vi.fn(), onExit: vi.fn(), kill: vi.fn() }
-      const spawnFn = vi.fn(() => pty)
-      const { app } = createServer({ port: 0, host: '127.0.0.1', execTimeoutMs: 1000 }, spawnFn)
-      await request(app).post('/api/sessions').send({ sessionId: 's1', projectPath: process.cwd() })
-      const res = await request(app).post('/api/sessions').send({ sessionId: 's1', projectPath: '/b' })
-      expect(res.status).toBe(409)
-      expect(res.body.error.type).toBe('session_conflict')
-    })
-  })
-
   describe('Cross-origin / DNS-rebinding protection on HTTP routes', () => {
     it('rejects a request whose Host header is not a loopback hostname, even without Origin', async () => {
       const { app } = createServer({ port: 0, host: '127.0.0.1', execTimeoutMs: 1000 }, vi.fn())
@@ -139,6 +104,49 @@ describe('createServer', () => {
       const { port } = httpServer.address()
 
       await expect(connect(port, 'http://litellm:4000')).resolves.toBe(true)
+    })
+  })
+
+  describe('WS /api/session/stream wiring', () => {
+    let httpServer
+
+    afterEach(() => {
+      httpServer?.close()
+    })
+
+    function connectAndCollect(port) {
+      return new Promise((resolve) => {
+        const messages = []
+        const ws = new WebSocket(`ws://127.0.0.1:${port}/api/session/stream`)
+        ws.on('message', (raw) => {
+          messages.push(JSON.parse(raw))
+          resolve({ ws, messages })
+        })
+      })
+    }
+
+    it('sends a snapshot of current sessions as soon as the dashboard connects', async () => {
+      ;({ httpServer } = createServer({ port: 0, host: '127.0.0.1', execTimeoutMs: 1000 }, vi.fn()))
+      await new Promise((resolve) => httpServer.listen(0, '127.0.0.1', resolve))
+      const { port } = httpServer.address()
+
+      const { ws, messages } = await connectAndCollect(port)
+      expect(messages[0]).toEqual({ type: 'snapshot', sessions: [] })
+      ws.close()
+    })
+
+    it('spawns the login PTY via the injected spawnFn when the dashboard sends login:start', async () => {
+      const pty = { write: vi.fn(), onData: vi.fn(), onExit: vi.fn(), kill: vi.fn() }
+      const spawnFn = vi.fn(() => pty)
+      ;({ httpServer } = createServer({ port: 0, host: '127.0.0.1', execTimeoutMs: 1000, readinessTimeoutMs: 10, readinessSettleMs: 1 }, spawnFn))
+      await new Promise((resolve) => httpServer.listen(0, '127.0.0.1', resolve))
+      const { port } = httpServer.address()
+
+      const { ws } = await connectAndCollect(port)
+      ws.send(JSON.stringify({ type: 'login:start' }))
+      await new Promise((resolve) => setTimeout(resolve, 50))
+      expect(spawnFn).toHaveBeenCalledTimes(1)
+      ws.close()
     })
   })
 })

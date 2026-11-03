@@ -1,150 +1,241 @@
-const term = new window.Terminal()
-const fitAddon = new window.FitAddon.FitAddon()
-term.loadAddon(fitAddon)
-term.open(document.getElementById('terminal'))
-fitAddon.fit()
-
 const statusBar = document.getElementById('status-bar')
-const sessionList = document.getElementById('session-list')
-const addSessionForm = document.getElementById('add-session-form')
-const sessionIdInput = document.getElementById('session-id-input')
-const projectPathInput = document.getElementById('project-path-input')
-const authButton = document.getElementById('auth-button')
-const authLink = document.getElementById('auth-link')
+const projectTree = document.getElementById('project-tree')
+const sessionDetail = document.getElementById('session-detail')
+const signInButton = document.getElementById('sign-in-button')
 
-const sessions = new Map()
-let currentSessionId = null
-let awaitingAuth = false
+const loginOverlay = document.getElementById('login-overlay')
+const loginStatus = document.getElementById('login-status')
+const loginLinkArea = document.getElementById('login-link-area')
+const loginUrlLink = document.getElementById('login-url-link')
+const loginRawOutput = document.getElementById('login-raw-output')
+const loginInputField = document.getElementById('login-input-field')
+const loginSendButton = document.getElementById('login-send-button')
+const loginSignedInButton = document.getElementById('login-signed-in-button')
+const loginCancelButton = document.getElementById('login-cancel-button')
 
-const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-const ws = new WebSocket(`${wsProtocol}//${window.location.host}/api/session/stream`)
+// Sessions only ever appear here because the API (/v1/chat/completions)
+// created them — there is no "add session" affordance any more. This map
+// is rebuilt from the server's snapshot on connect and kept in sync by
+// session:update events; it is purely a read-only observability view.
+const sessionsById = new Map()
+const liveOutputBySession = new Map()
+let selectedSessionId = null
 
 const URL_PATTERN = /https?:\/\/\S+/
 const CODE_PATTERN = /\b[A-Za-z0-9-]{6,12}\b/
+let loginAwaitingAuth = false
+let loginOutputBuffer = ''
+
+const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+const ws = new WebSocket(`${wsProtocol}//${window.location.host}/api/session/stream`)
 
 function setStatus(text) {
   statusBar.textContent = `Status: ${text}`
 }
 
-// The PTY is spawned at a fixed size before the browser has ever reported
-// its own (see src/sessionManager.js), so the CLI's full-screen TUI starts
-// out positioning its cursor for a terminal width that doesn't match what
-// xterm.js actually renders — the result is garbled, wrapped-wrong output
-// until the server is told the real size.
-function fitAndNotify() {
-  fitAddon.fit()
-  if (currentSessionId && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({ type: 'resize', sessionId: currentSessionId, cols: term.cols, rows: term.rows }))
-  }
+function escapeHtml(text) {
+  const div = document.createElement('div')
+  div.textContent = text ?? ''
+  return div.innerHTML
 }
 
-new ResizeObserver(fitAndNotify).observe(document.getElementById('terminal'))
-ws.addEventListener('open', fitAndNotify)
+function renderProjectTree() {
+  projectTree.innerHTML = ''
 
-function selectSession(sessionId) {
-  currentSessionId = sessionId
-  term.clear()
-  awaitingAuth = false
-  authLink.hidden = true
-  setStatus('unknown')
-  fitAndNotify()
-}
-
-function renderSessionList() {
-  sessionList.innerHTML = ''
-  for (const sessionId of sessions.keys()) {
-    const li = document.createElement('li')
-    li.textContent = sessionId
-    li.addEventListener('click', () => selectSession(sessionId))
-    sessionList.appendChild(li)
-  }
-}
-
-// The dashboard only ever talks to sessions the backend already knows
-// about (WS input for an unknown sessionId gets an error frame). This
-// debug terminal drives its own PTY session directly via POST
-// /api/sessions, independent of /v1/chat/completions' own per-turn
-// session bookkeeping — the two are unrelated sessions by design, so a
-// sessionId used here is not implicitly usable as a chat-completions
-// sessionId, and vice versa.
-async function ensureBackendSession(sessionId, projectPath) {
-  try {
-    const res = await fetch('/api/sessions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sessionId, projectPath }),
-    })
-    if (!res.ok) {
-      const body = await res.json().catch(() => null)
-      return { ok: false, message: body?.error?.message ?? `request failed (${res.status})` }
-    }
-    return { ok: true }
-  } catch (err) {
-    return { ok: false, message: err.message }
-  }
-}
-
-addSessionForm.addEventListener('submit', async (event) => {
-  event.preventDefault()
-  const sessionId = sessionIdInput.value.trim()
-  const projectPath = projectPathInput.value.trim()
-  if (!sessionId || !projectPath) return
-  sessionIdInput.value = ''
-  projectPathInput.value = ''
-
-  // The debug terminal has nothing to attach to until the backend PTY
-  // session actually exists, so wait for that before selecting it (or
-  // showing it in the list at all, if it was rejected).
-  const result = await ensureBackendSession(sessionId, projectPath)
-  if (!result.ok) {
-    setStatus(`failed to add session: ${result.message}`)
+  if (sessionsById.size === 0) {
+    const empty = document.createElement('p')
+    empty.className = 'empty'
+    empty.textContent = 'No sessions yet — they appear here once a request comes in through the API.'
+    projectTree.appendChild(empty)
     return
   }
-  sessions.set(sessionId, { projectPath })
-  renderSessionList()
-  selectSession(sessionId)
-})
 
-authButton.addEventListener('click', () => {
-  if (!currentSessionId || ws.readyState !== WebSocket.OPEN) return
-  ws.send(JSON.stringify({ type: 'input', sessionId: currentSessionId, data: '/login\r' }))
-})
+  const byProject = new Map()
+  for (const session of sessionsById.values()) {
+    const list = byProject.get(session.projectPath) ?? []
+    list.push(session)
+    byProject.set(session.projectPath, list)
+  }
 
-// The debug console is interactive per PRD §3 Component B ("for manual
-// intervention if the agent gets stuck") — keystrokes typed into it go to
-// the selected session's PTY. Terminals submit on \r (carriage return),
-// not \n.
-term.onData((data) => {
-  if (!currentSessionId || ws.readyState !== WebSocket.OPEN) return
-  ws.send(JSON.stringify({ type: 'input', sessionId: currentSessionId, data }))
-})
+  for (const [projectPath, sessions] of byProject) {
+    const group = document.createElement('div')
+    group.className = 'project-group'
+
+    const heading = document.createElement('div')
+    heading.className = 'project-path'
+    heading.textContent = projectPath
+    group.appendChild(heading)
+
+    const list = document.createElement('ul')
+    for (const session of sessions.sort((a, b) => a.sessionId.localeCompare(b.sessionId))) {
+      const li = document.createElement('li')
+      li.className = `session-row status-${session.status}${session.sessionId === selectedSessionId ? ' selected' : ''}`
+      li.textContent = `${session.sessionId} · ${session.status}`
+      li.addEventListener('click', () => selectSession(session.sessionId))
+      list.appendChild(li)
+    }
+    group.appendChild(list)
+    projectTree.appendChild(group)
+  }
+}
+
+function selectSession(sessionId) {
+  selectedSessionId = sessionId
+  renderProjectTree()
+  renderSessionDetail()
+}
+
+function renderSessionDetail() {
+  const session = sessionsById.get(selectedSessionId)
+  if (!session) {
+    sessionDetail.innerHTML = '<p class="empty">Select a session to view its activity.</p>'
+    return
+  }
+
+  const live = liveOutputBySession.get(selectedSessionId) ?? ''
+  const { lastRequest, lastResult, lastError } = session
+
+  sessionDetail.innerHTML = `
+    <h2>${escapeHtml(session.sessionId)}</h2>
+    <p class="project-path">${escapeHtml(session.projectPath)}</p>
+    <p class="status-badge status-${session.status}">${session.status}</p>
+    ${lastRequest ? `
+      <section>
+        <h3>Request</h3>
+        <p>model: ${escapeHtml(lastRequest.model ?? 'default')}</p>
+        <p>messages: ${lastRequest.messageCount}</p>
+        <p>last message: ${escapeHtml(lastRequest.lastUserMessage ?? '')}</p>
+      </section>` : ''}
+    ${session.status === 'running' ? `
+      <section>
+        <h3>Live output</h3>
+        <pre class="live-output">${escapeHtml(live)}</pre>
+      </section>` : ''}
+    ${lastResult ? `
+      <section>
+        <h3>Last result</h3>
+        <pre>${escapeHtml(lastResult.content ?? '')}</pre>
+        <p>finish_reason: ${escapeHtml(lastResult.finishReason ?? '')}</p>
+        <p>tokens: ${lastResult.usage?.total_tokens ?? '?'}</p>
+      </section>` : ''}
+    ${lastError ? `
+      <section class="error">
+        <h3>Last error</h3>
+        <p>${escapeHtml(lastError.message ?? '')}</p>
+      </section>` : ''}
+  `
+}
+
+ws.addEventListener('open', () => setStatus('connected'))
+ws.addEventListener('close', () => setStatus('disconnected'))
 
 ws.addEventListener('message', (event) => {
   const frame = JSON.parse(event.data)
-  if (frame.sessionId !== currentSessionId) return
 
-  if (frame.type === 'output') {
-    term.write(frame.data)
-
-    const urlMatch = frame.data.match(URL_PATTERN)
-    const codeMatch = frame.data.match(CODE_PATTERN)
-    if (urlMatch && codeMatch) {
-      awaitingAuth = true
-      authLink.hidden = false
-      authLink.replaceChildren()
-      const a = document.createElement('a')
-      a.href = urlMatch[0]
-      a.target = '_blank'
-      a.rel = 'noopener noreferrer'
-      a.textContent = `${urlMatch[0]} (code: ${codeMatch[0]})`
-      authLink.appendChild(a)
-      setStatus('requires interaction')
-    } else if (awaitingAuth) {
-      awaitingAuth = false
-      authLink.hidden = true
-      setStatus('authenticated')
-    }
-  } else if (frame.type === 'error') {
-    term.write(`\r\n[error] ${frame.data}\r\n`)
+  if (frame.type === 'snapshot') {
+    sessionsById.clear()
+    for (const session of frame.sessions) sessionsById.set(session.sessionId, session)
+    renderProjectTree()
+    renderSessionDetail()
+    return
   }
+
+  if (frame.type === 'session:update') {
+    sessionsById.set(frame.session.sessionId, frame.session)
+    // A fresh turn starting clears the previous turn's accumulated live
+    // output so it doesn't get appended to by mistake.
+    if (frame.session.status === 'running') liveOutputBySession.set(frame.session.sessionId, '')
+    renderProjectTree()
+    if (frame.session.sessionId === selectedSessionId) renderSessionDetail()
+    return
+  }
+
+  if (frame.type === 'session:delta') {
+    const current = liveOutputBySession.get(frame.sessionId) ?? ''
+    liveOutputBySession.set(frame.sessionId, current + frame.text)
+    if (frame.sessionId === selectedSessionId) renderSessionDetail()
+    return
+  }
+
+  if (frame.type === 'login:output') {
+    handleLoginOutput(frame.data)
+    return
+  }
+
+  if (frame.type === 'error') {
+    setStatus(`error: ${frame.data}`)
+  }
+})
+
+function openLoginOverlay() {
+  loginOverlay.hidden = false
+  loginStatus.textContent = 'Starting…'
+  loginLinkArea.hidden = true
+  loginRawOutput.textContent = ''
+  loginOutputBuffer = ''
+  loginAwaitingAuth = false
+  loginInputField.value = ''
+  loginInputField.focus()
+}
+
+function closeLoginOverlay() {
+  loginOverlay.hidden = true
+}
+
+function completeLogin(statusText) {
+  loginStatus.textContent = statusText
+  ws.send(JSON.stringify({ type: 'login:complete' }))
+  setTimeout(closeLoginOverlay, 1500)
+}
+
+function sendLoginInput() {
+  const value = loginInputField.value
+  if (!value) return
+  ws.send(JSON.stringify({ type: 'login:input', data: `${value}\r` }))
+  loginInputField.value = ''
+}
+
+// The CLI's /login flow isn't always just "a URL and code to open" — it
+// can start with a method-selection menu, or other prompts, before (or
+// instead of) ever showing one. The input row above is always available so
+// the user can answer whatever's actually being asked; this just surfaces
+// a URL+code pair prominently as a convenience when one appears, and
+// offers to auto-complete once further output follows it (the same
+// heuristic the old debug terminal used) — "I'm signed in" below covers
+// the case where that heuristic doesn't fire.
+function handleLoginOutput(chunk) {
+  loginOutputBuffer += chunk
+  loginRawOutput.textContent = loginOutputBuffer
+  loginRawOutput.scrollTop = loginRawOutput.scrollHeight
+
+  const urlMatch = chunk.match(URL_PATTERN)
+  const codeMatch = chunk.match(CODE_PATTERN)
+  if (urlMatch && codeMatch) {
+    loginAwaitingAuth = true
+    loginStatus.textContent = 'Open this link and authorize, then respond below if asked.'
+    loginUrlLink.href = urlMatch[0]
+    loginUrlLink.textContent = `${urlMatch[0]} (code: ${codeMatch[0]})`
+    loginLinkArea.hidden = false
+  } else if (loginAwaitingAuth) {
+    loginAwaitingAuth = false
+    completeLogin('Signed in.')
+  }
+}
+
+signInButton.addEventListener('click', () => {
+  openLoginOverlay()
+  ws.send(JSON.stringify({ type: 'login:start' }))
+})
+
+loginSendButton.addEventListener('click', sendLoginInput)
+loginInputField.addEventListener('keydown', (event) => {
+  if (event.key === 'Enter') sendLoginInput()
+})
+
+loginSignedInButton.addEventListener('click', () => {
+  completeLogin('Signed in.')
+})
+
+loginCancelButton.addEventListener('click', () => {
+  closeLoginOverlay()
 })
