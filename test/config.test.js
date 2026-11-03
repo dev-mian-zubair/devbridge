@@ -11,13 +11,14 @@ describe('loadConfig', () => {
       execTimeoutMs: 120000,
       readinessTimeoutMs: 5000,
       readinessSettleMs: 250,
+      trustedHosts: [],
     })
   })
 
   it('overrides defaults from the given env object', () => {
     const cfg = loadConfig({
       PORT: '4000', HOST: '0.0.0.0', CLAUDE_CONFIG_DIR: '/x', EXEC_TIMEOUT_MS: '5000',
-      READINESS_TIMEOUT_MS: '9000', READINESS_SETTLE_MS: '400',
+      READINESS_TIMEOUT_MS: '9000', READINESS_SETTLE_MS: '400', TRUSTED_HOSTS: 'litellm:4000,gateway',
     })
     expect(cfg).toEqual({
       port: 4000,
@@ -26,7 +27,13 @@ describe('loadConfig', () => {
       execTimeoutMs: 5000,
       readinessTimeoutMs: 9000,
       readinessSettleMs: 400,
+      trustedHosts: ['litellm:4000', 'gateway'],
     })
+  })
+
+  it('trims entries and drops empty ones from TRUSTED_HOSTS', () => {
+    const cfg = loadConfig({ TRUSTED_HOSTS: ' litellm:4000 , , gateway ,' })
+    expect(cfg.trustedHosts).toEqual(['litellm:4000', 'gateway'])
   })
 
   it('falls back to defaults when numeric env vars are not valid numbers', () => {

@@ -82,6 +82,30 @@ describe('createServer', () => {
       const res = await request(app).get('/').set('Origin', 'http://127.0.0.1:3000')
       expect(res.status).toBe(200)
     })
+
+    it('rejects a non-loopback Host when trustedHosts is empty (default)', async () => {
+      const { app } = createServer({ port: 0, host: '127.0.0.1', execTimeoutMs: 1000, trustedHosts: [] }, vi.fn())
+      const res = await request(app).get('/').set('Host', 'litellm:4000')
+      expect(res.status).toBe(403)
+    })
+
+    it('allows a Host explicitly named in trustedHosts (port is ignored, same as loopback)', async () => {
+      const { app } = createServer({ port: 0, host: '127.0.0.1', execTimeoutMs: 1000, trustedHosts: ['litellm'] }, vi.fn())
+      const res = await request(app).get('/').set('Host', 'litellm:4000')
+      expect(res.status).toBe(200)
+    })
+
+    it('still rejects a Host not in trustedHosts even when the list is non-empty', async () => {
+      const { app } = createServer({ port: 0, host: '127.0.0.1', execTimeoutMs: 1000, trustedHosts: ['litellm'] }, vi.fn())
+      const res = await request(app).get('/').set('Host', 'evil.example')
+      expect(res.status).toBe(403)
+    })
+
+    it('allows an Origin explicitly named in trustedHosts', async () => {
+      const { app } = createServer({ port: 0, host: '127.0.0.1', execTimeoutMs: 1000, trustedHosts: ['litellm'] }, vi.fn())
+      const res = await request(app).get('/').set('Host', 'litellm:4000').set('Origin', 'http://litellm:4000')
+      expect(res.status).toBe(200)
+    })
   })
 
   describe('WS /api/session/stream origin check', () => {
@@ -107,6 +131,14 @@ describe('createServer', () => {
 
       await expect(connect(port, `http://127.0.0.1:${port}`)).resolves.toBe(true)
       await expect(connect(port, 'http://evil.example')).resolves.toBe(false)
+    })
+
+    it('accepts an upgrade whose Origin is explicitly named in trustedHosts', async () => {
+      ;({ httpServer } = createServer({ port: 0, host: '127.0.0.1', execTimeoutMs: 1000, trustedHosts: ['litellm'] }, vi.fn()))
+      await new Promise((resolve) => httpServer.listen(0, '127.0.0.1', resolve))
+      const { port } = httpServer.address()
+
+      await expect(connect(port, 'http://litellm:4000')).resolves.toBe(true)
     })
   })
 })

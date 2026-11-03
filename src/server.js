@@ -18,8 +18,15 @@ const publicDir = path.join(__dirname, '..', 'public')
 // DNS rebinding lets an attacker-controlled domain resolve to 127.0.0.1, so
 // Origin and Host can be attacker-controlled *together* — comparing them to
 // each other (the previous approach) proves nothing. Both are instead
-// checked independently against a fixed loopback allowlist.
-const LOOPBACK_HOSTNAMES = new Set(['127.0.0.1', 'localhost', '[::1]', '::1'])
+// checked independently against a fixed hostname allowlist: loopback plus
+// whatever hostnames the operator explicitly named via TRUSTED_HOSTS (e.g. a
+// gateway's hostname on a private docker-compose network) — never a
+// wildcard, so the deny-by-default posture holds for everything else.
+const LOOPBACK_HOSTNAMES = ['127.0.0.1', 'localhost', '[::1]', '::1']
+
+function buildTrustedHostnames(additional = []) {
+  return new Set([...LOOPBACK_HOSTNAMES, ...additional])
+}
 
 function hostnameOf(hostHeader) {
   if (!hostHeader) return null
@@ -30,44 +37,48 @@ function hostnameOf(hostHeader) {
   return hostHeader.split(':')[0]
 }
 
-function isLoopbackHostname(hostHeader) {
+function isTrustedHostHeader(hostHeader, trustedHostnames) {
   const hostname = hostnameOf(hostHeader)
-  return hostname !== null && LOOPBACK_HOSTNAMES.has(hostname)
+  return hostname !== null && trustedHostnames.has(hostname)
 }
 
-function sameOriginOnly(req, res, next) {
-  if (!isLoopbackHostname(req.headers.host)) {
-    return res.status(403).json({ error: { message: 'forbidden host', type: 'forbidden' } })
+function createSameOriginOnly(trustedHostnames) {
+  return function sameOriginOnly(req, res, next) {
+    if (!isTrustedHostHeader(req.headers.host, trustedHostnames)) {
+      return res.status(403).json({ error: { message: 'forbidden host', type: 'forbidden' } })
+    }
+    const origin = req.headers.origin
+    if (origin) {
+      let originHost
+      try {
+        originHost = new URL(origin).host
+      } catch {
+        return res.status(403).json({ error: { message: 'forbidden origin', type: 'forbidden' } })
+      }
+      if (!isTrustedHostHeader(originHost, trustedHostnames)) {
+        return res.status(403).json({ error: { message: 'forbidden origin', type: 'forbidden' } })
+      }
+    }
+    next()
   }
-  const origin = req.headers.origin
-  if (origin) {
-    let originHost
+}
+
+function createIsAllowedOrigin(trustedHostnames) {
+  return function isAllowedOrigin({ req }) {
+    if (!isTrustedHostHeader(req.headers.host, trustedHostnames)) return false
+    const origin = req.headers.origin
+    if (!origin) return true
     try {
-      originHost = new URL(origin).host
+      return isTrustedHostHeader(new URL(origin).host, trustedHostnames)
     } catch {
-      return res.status(403).json({ error: { message: 'forbidden origin', type: 'forbidden' } })
+      return false
     }
-    if (!isLoopbackHostname(originHost)) {
-      return res.status(403).json({ error: { message: 'forbidden origin', type: 'forbidden' } })
-    }
-  }
-  next()
-}
-
-function isAllowedOrigin({ req }) {
-  if (!isLoopbackHostname(req.headers.host)) return false
-  const origin = req.headers.origin
-  if (!origin) return true
-  try {
-    return isLoopbackHostname(new URL(origin).host)
-  } catch {
-    return false
   }
 }
 
-export function createApp(sessionManager, turnSessions, runner, { timeoutMs = 120000 } = {}) {
+export function createApp(sessionManager, turnSessions, runner, { timeoutMs = 120000, trustedHosts = [] } = {}) {
   const app = express()
-  app.use(sameOriginOnly)
+  app.use(createSameOriginOnly(buildTrustedHostnames(trustedHosts)))
   app.use(express.json())
   app.use(express.static(publicDir))
 
@@ -106,12 +117,15 @@ export function createServer(config, spawnFn) {
   })
   const turnSessions = createTurnSessions()
   const runner = createClaudeCliRunner()
-  const app = createApp(sessionManager, turnSessions, runner, { timeoutMs: config.execTimeoutMs })
+  const app = createApp(sessionManager, turnSessions, runner, {
+    timeoutMs: config.execTimeoutMs,
+    trustedHosts: config.trustedHosts,
+  })
   const httpServer = http.createServer(app)
   const wss = new WebSocketServer({
     server: httpServer,
     path: '/api/session/stream',
-    verifyClient: isAllowedOrigin,
+    verifyClient: createIsAllowedOrigin(buildTrustedHostnames(config.trustedHosts)),
   })
   wss.on('connection', createSessionStreamHandler(sessionManager))
   return { app, httpServer, wss }
