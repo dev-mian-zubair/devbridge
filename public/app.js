@@ -1,5 +1,8 @@
 const term = new window.Terminal()
+const fitAddon = new window.FitAddon.FitAddon()
+term.loadAddon(fitAddon)
 term.open(document.getElementById('terminal'))
+fitAddon.fit()
 
 const statusBar = document.getElementById('status-bar')
 const sessionList = document.getElementById('session-list')
@@ -23,12 +26,28 @@ function setStatus(text) {
   statusBar.textContent = `Status: ${text}`
 }
 
+// The PTY is spawned at a fixed size before the browser has ever reported
+// its own (see src/sessionManager.js), so the CLI's full-screen TUI starts
+// out positioning its cursor for a terminal width that doesn't match what
+// xterm.js actually renders — the result is garbled, wrapped-wrong output
+// until the server is told the real size.
+function fitAndNotify() {
+  fitAddon.fit()
+  if (currentSessionId && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'resize', sessionId: currentSessionId, cols: term.cols, rows: term.rows }))
+  }
+}
+
+new ResizeObserver(fitAndNotify).observe(document.getElementById('terminal'))
+ws.addEventListener('open', fitAndNotify)
+
 function selectSession(sessionId) {
   currentSessionId = sessionId
   term.clear()
   awaitingAuth = false
   authLink.hidden = true
   setStatus('unknown')
+  fitAndNotify()
 }
 
 function renderSessionList() {

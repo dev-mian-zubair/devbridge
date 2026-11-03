@@ -20,6 +20,7 @@ function fakePtyFactory() {
   return {
     spawnFn: vi.fn(() => ({
       write: vi.fn(),
+      resize: vi.fn(),
       onData: (cb) => {
         dataCb = cb
         const spy = vi.fn()
@@ -90,6 +91,40 @@ describe('createSessionStreamHandler', () => {
     const onMessage = ws.on.mock.calls.find(([event]) => event === 'message')[1]
     expect(() => onMessage(JSON.stringify({ type: 'input', sessionId: 's1', data: 42 }))).not.toThrow()
     expect(ws.send).toHaveBeenCalledWith(JSON.stringify({ type: 'error', sessionId: 's1', data: 'invalid frame' }))
+  })
+
+  it('resizes the matching session PTY on a resize frame', async () => {
+    const { spawnFn } = fakePtyFactory()
+    const sessionManager = createSessionManager(spawnFn, FAKE_STAT)
+    const session = await sessionManager.getOrCreate('s1', '/app/workspace/proj')
+    const ws = fakeWs()
+    const handler = createSessionStreamHandler(sessionManager)
+    handler(ws, {})
+    const onMessage = ws.on.mock.calls.find(([event]) => event === 'message')[1]
+    onMessage(JSON.stringify({ type: 'resize', sessionId: 's1', cols: 100, rows: 30 }))
+    expect(session.pty.resize).toHaveBeenCalledWith(100, 30)
+  })
+
+  it('sends an error frame for a resize frame with non-integer cols/rows instead of throwing', async () => {
+    const { spawnFn } = fakePtyFactory()
+    const sessionManager = createSessionManager(spawnFn, FAKE_STAT)
+    await sessionManager.getOrCreate('s1', '/app/workspace/proj')
+    const ws = fakeWs()
+    const handler = createSessionStreamHandler(sessionManager)
+    handler(ws, {})
+    const onMessage = ws.on.mock.calls.find(([event]) => event === 'message')[1]
+    expect(() => onMessage(JSON.stringify({ type: 'resize', sessionId: 's1', cols: 'wide', rows: 30 }))).not.toThrow()
+    expect(ws.send).toHaveBeenCalledWith(JSON.stringify({ type: 'error', sessionId: 's1', data: 'invalid frame' }))
+  })
+
+  it('sends an error frame for a resize frame targeting an unknown sessionId', () => {
+    const sessionManager = createSessionManager(vi.fn())
+    const ws = fakeWs()
+    const handler = createSessionStreamHandler(sessionManager)
+    handler(ws, {})
+    const onMessage = ws.on.mock.calls.find(([event]) => event === 'message')[1]
+    onMessage(JSON.stringify({ type: 'resize', sessionId: 'missing', cols: 100, rows: 30 }))
+    expect(ws.send).toHaveBeenCalledWith(JSON.stringify({ type: 'error', sessionId: 'missing', data: 'unknown session' }))
   })
 
   it('disposes all subscribed PTY data listeners when the socket closes', async () => {
