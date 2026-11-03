@@ -82,9 +82,9 @@ docker run \
 ```bash
 curl http://127.0.0.1:3000/v1/chat/completions \
   -H 'Content-Type: application/json' \
+  -H 'X-Session-Id: s1' \
+  -H 'X-Project-Path: /app/workspace/project' \
   -d '{
-    "sessionId": "s1",
-    "projectPath": "/app/workspace/project",
     "model": "opus",
     "messages": [{ "role": "user", "content": "say OK" }]
   }'
@@ -103,9 +103,14 @@ curl http://127.0.0.1:3000/v1/chat/completions \
 }
 ```
 
-- `sessionId`/`projectPath` are required; the same `sessionId` must always be
-  paired with the same `projectPath` (409 `session_conflict` otherwise).
-  `projectPath` must be an absolute path mounted into the container.
+- `sessionId`/`projectPath` are required, as the `X-Session-Id` /
+  `X-Project-Path` headers (preferred — keeps the JSON body pure OpenAI wire
+  format, so an off-the-shelf OpenAI SDK with default headers configured
+  needs no payload changes) or as `sessionId`/`projectPath` body fields
+  (still supported; a header takes precedence if both are given). The same
+  `sessionId` must always be paired with the same `projectPath` (409
+  `session_conflict` otherwise). `projectPath` must be an absolute path
+  mounted into the container.
 - `model` is optional and passed straight through to `--model` (accepts the
   CLI's own aliases, e.g. `opus`/`sonnet`/`haiku`, or a full model name),
   restricted to a safe charset (letters, numbers, `. - _ :`). The

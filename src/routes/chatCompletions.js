@@ -19,15 +19,15 @@ function extractText(content) {
   return null
 }
 
-function validateRequest(body) {
-  if (typeof body?.sessionId !== 'string' || body.sessionId.length === 0) {
-    return { error: 'sessionId, projectPath, and a last message with text content are required' }
+function validateRequest(body, sessionId, projectPath) {
+  if (typeof sessionId !== 'string' || sessionId.length === 0) {
+    return { error: 'sessionId is required, as the X-Session-Id header or a body field' }
   }
-  if (typeof body?.projectPath !== 'string' || body.projectPath.length === 0) {
-    return { error: 'sessionId, projectPath, and a last message with text content are required' }
+  if (typeof projectPath !== 'string' || projectPath.length === 0) {
+    return { error: 'projectPath is required, as the X-Project-Path header or a body field' }
   }
   if (!Array.isArray(body?.messages) || body.messages.length === 0) {
-    return { error: 'sessionId, projectPath, and a last message with text content are required' }
+    return { error: 'a non-empty messages array with a last message of text content is required' }
   }
 
   const lastMessage = body.messages[body.messages.length - 1]
@@ -90,13 +90,19 @@ export function createChatCompletionsRouter({ sessions, runner, timeoutMs }) {
   const busySessions = new Set()
 
   router.post('/v1/chat/completions', async (req, res) => {
-    const validation = validateRequest(req.body)
+    // Headers let a client keep the JSON body pure OpenAI wire format (no
+    // app-specific fields); body fields remain supported for existing
+    // callers, with the header taking precedence when both are given.
+    const sessionId = req.get('x-session-id') || req.body?.sessionId
+    const projectPath = req.get('x-project-path') || req.body?.projectPath
+
+    const validation = validateRequest(req.body, sessionId, projectPath)
     if (validation.error) {
       noRetry(res)
       return res.status(400).json({ error: { message: validation.error, type: 'invalid_request_error' } })
     }
 
-    const { sessionId, projectPath, model } = req.body
+    const { model } = req.body
     const { content, systemPrompt } = validation
     const stream = req.body.stream === true
 

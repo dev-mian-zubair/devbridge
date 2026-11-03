@@ -143,6 +143,50 @@ describe('POST /v1/chat/completions', () => {
     expect(runner.pending[1].opts.claudeSessionId).toBe('claude-uuid-1')
   })
 
+  describe('X-Session-Id / X-Project-Path headers', () => {
+    it('accepts sessionId and projectPath via headers when the body omits them entirely', async () => {
+      const runner = fakeRunner()
+      const { app } = appWith(runner)
+      const reqPromise = request(app).post('/v1/chat/completions')
+        .set('X-Session-Id', 's1')
+        .set('X-Project-Path', '/app/workspace/proj')
+        .send({ messages: [{ role: 'user', content: 'hello' }] })
+      reqPromise.catch(() => {})
+      await waitForPending(runner)
+      runner.pending[0].resolve(outcome())
+      const res = await reqPromise
+      expect(res.status).toBe(200)
+      expect(runner.pending[0].opts.projectPath).toBe('/app/workspace/proj')
+    })
+
+    it('prefers header values over body fields when both are present', async () => {
+      const runner = fakeRunner()
+      const { app } = appWith(runner)
+      // The body's projectPath is relative (would 400 on its own); the header's
+      // absolute path should be the one actually used.
+      const reqPromise = request(app).post('/v1/chat/completions')
+        .set('X-Session-Id', 's1')
+        .set('X-Project-Path', '/app/workspace/proj')
+        .send({ sessionId: 's-from-body', projectPath: 'relative/path', messages: [{ role: 'user', content: 'hi' }] })
+      reqPromise.catch(() => {})
+      await waitForPending(runner)
+      runner.pending[0].resolve(outcome())
+      const res = await reqPromise
+      expect(res.status).toBe(200)
+      expect(runner.pending[0].opts.projectPath).toBe('/app/workspace/proj')
+    })
+
+    it('still returns 400 when sessionId/projectPath are missing from both headers and body', async () => {
+      const runner = fakeRunner()
+      const { app } = appWith(runner)
+      const res = await request(app).post('/v1/chat/completions').send({
+        messages: [{ role: 'user', content: 'hi' }],
+      })
+      expect(res.status).toBe(400)
+      expect(res.body.error.type).toBe('invalid_request_error')
+    })
+  })
+
   it('returns 400 for a request missing a non-empty messages array', async () => {
     const runner = fakeRunner()
     const { app } = appWith(runner)
