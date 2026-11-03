@@ -118,6 +118,7 @@ environment variables — see `.env.example`:
 | `EXEC_TIMEOUT_MS` | `120000` | Max time a single turn may run before it's killed. |
 | `READINESS_TIMEOUT_MS` | `5000` | Max time to wait for a fresh PTY session (debug terminal) to become ready. |
 | `READINESS_SETTLE_MS` | `250` | Quiet period used to decide the PTY has finished its startup banner. |
+| `TRUSTED_HOSTS` | *(empty)* | Comma-separated hostnames (no port — ports are ignored, same as the loopback check) explicitly trusted in addition to `127.0.0.1`/`localhost`/`::1`. For a gateway (LiteLLM, Open WebUI, ...) running in its own container on a private network — see [Using with LiteLLM and other gateways](#using-with-litellm-and-other-openai-compatible-gateways). Never set this to a wildcard or to a hostname you don't control. |
 
 ## Running tests
 
@@ -125,7 +126,7 @@ environment variables — see `.env.example`:
 npm test
 ```
 
-91+ tests across one file per `src/` module (`vitest` + `supertest`), no
+120+ tests across one file per `src/` module (`vitest` + `supertest`), no
 network access and no real CLI invocation — the CLI process is always
 injected (`spawnFn`) and faked.
 
@@ -198,9 +199,19 @@ curl http://127.0.0.1:3000/v1/chat/completions \
   "created": 1730000000,
   "model": "claude-opus-5-5",
   "choices": [
-    { "index": 0, "message": { "role": "assistant", "content": "OK" }, "finish_reason": "stop" }
+    {
+      "index": 0,
+      "message": { "role": "assistant", "content": "OK", "refusal": null },
+      "finish_reason": "stop",
+      "logprobs": null
+    }
   ],
-  "usage": { "prompt_tokens": 11382, "completion_tokens": 4, "total_tokens": 11386 }
+  "usage": {
+    "prompt_tokens": 11382,
+    "completion_tokens": 4,
+    "total_tokens": 11386,
+    "prompt_tokens_details": { "cached_tokens": 11200 }
+  }
 }
 ```
 
@@ -238,6 +249,8 @@ curl http://127.0.0.1:3000/v1/chat/completions \
   its last entry and any `system` entries are used.
 - `content` may be a plain string or an OpenAI-style array of
   `{"type": "text", "text": "..."}` parts, which are concatenated.
+- `role: "developer"` messages are treated identically to `role: "system"`
+  (OpenAI's newer name for the same thing).
 
 **Response fields**
 
@@ -245,8 +258,72 @@ curl http://127.0.0.1:3000/v1/chat/completions \
   `input_tokens + cache_read_input_tokens + cache_creation_input_tokens`
   (everything the turn paid to read as context, including anything served
   from cache), `completion_tokens` is `output_tokens`.
+- `usage.prompt_tokens_details.cached_tokens` reports `cache_read_input_tokens`
+  specifically (OpenAI's own usage-details convention), for clients doing
+  cache-aware cost math.
 - `finish_reason` is `"length"` when the CLI's own stop reason was
   `max_tokens`, `"stop"` otherwise.
+- `message.refusal` and `choices[].logprobs` are always `null` — present for
+  shape compatibility with strict OpenAI clients, never populated (the CLI
+  doesn't produce either).
+
+### OpenAI API field compatibility
+
+This proxy wraps an agentic CLI, not a raw sampling endpoint, so not every
+OpenAI Chat Completions field has something to map onto. Each request field
+falls into one of four buckets:
+
+| Supported & mapped | Accepted, silently ignored | Mapped to a real CLI flag | Rejected (400) |
+|---|---|---|---|
+| `model`, `messages`, `stream`, `stream_options.include_usage` | `temperature`, `top_p`, `frequency_penalty`, `presence_penalty`, `logit_bias`, `seed`, `user`/`prompt_cache_key`, `metadata`, `store`, `service_tier`, `prediction`, `moderation`, `parallel_tool_calls`, `safety_identifier`, `max_tokens`/`max_completion_tokens`, `modalities: ["text"]`, `logprobs: false` | `reasoning_effort` → `--effort`; `response_format` (`json_schema` variant) → `--json-schema` | `tools`, `tool_choice`, `functions`, `function_call`, `n > 1`, `logprobs: true`, `top_logprobs`, `modalities` containing anything other than `"text"`, `audio` |
+
+**Why `logprobs`/`modalities` are conditionally rejected, not just ignored**:
+both default to the CLI's actual behavior (no logprobs, text-only), so the
+default value is a true no-op — but `logprobs: true` or `modalities:
+["text", "audio"]` is the client asking for something the CLI cannot
+produce. Silently returning the default (`logprobs: null`, text output)
+instead of what was requested is the same "misrepresents what happened"
+risk as the `tools` gap below, not a harmless default to ignore.
+
+**Why the "accepted, silently ignored" fields aren't errors**: most real
+OpenAI client SDKs send several of these with default values on every call
+(e.g. `temperature: 1`) whether or not the caller set them explicitly —
+rejecting their mere presence would break those clients for no benefit,
+since there's nothing to enforce differently anyway. `max_tokens` falls
+here too: there's no CLI flag that caps output length directly (only
+`--max-budget-usd`, a dollar cap, not a token cap), so it's accepted and
+ignored rather than rejected, to match how the other sampling knobs are
+treated.
+
+**`reasoning_effort` → `--effort`**: the CLI genuinely has an equivalent
+(`--effort <low|medium|high|xhigh|max>`). Only those five values are
+accepted; OpenAI's `"none"`/`"minimal"` have no CLI equivalent and are
+rejected with 400 rather than silently clamped to the nearest supported
+level.
+
+**`response_format` → `--json-schema`**: only the `json_schema` variant
+maps to anything real — the CLI's `--json-schema <schema>` flag is actually
+enforced (verified live: a request with a schema requiring a specific field
+gets back content that validates against it). `"text"` (the default) and
+`"json_object"` are no-ops; OpenAI itself only weakly enforces
+`json_object` too ("the model must be told to produce JSON in a system or
+user message"), so nothing is lost by not enforcing it here either.
+`response_format.json_schema` without a `schema` field is a 400.
+
+**Why `tools`/`tool_choice`/`functions` are rejected outright, not
+ignored**: OpenAI's tool calling is a *client-executes* contract — the
+model proposes `tool_calls` with arguments, the caller runs the real
+function and reports the result back in a follow-up request. The CLI's own
+tools (Bash, Edit, Read, ...) are *agent-executes*: they run inline, inside
+a single turn, the moment the agent decides to use them, with no point
+where it pauses and waits for a caller-supplied result. There's no safe way
+to no-op this: a client that expects `tool_calls` back and instead silently
+gets an ordinary text reply could easily misread that as "the model chose
+not to call anything," which is worse than a clear 400. (The CLI *can* load
+MCP servers via `--mcp-config`, so a real bridge — the CLI calling out
+mid-turn to a server that forwards to the HTTP client and waits for a
+result — is possible in principle, but that's a standalone feature, not a
+field mapping.)
 
 **Streaming**
 
@@ -286,7 +363,38 @@ curl http://127.0.0.1:3000/v1/chat/completions \
 ### `GET /v1/models`
 
 Lists the model aliases the CLI itself exposes (`opus`, `sonnet`, `haiku`,
-`fable`), for clients that probe this before use.
+`fable`), for clients that probe this before use. Open WebUI and similar
+tools call this to populate a model picker; the response shape
+(`{"object": "list", "data": [{"id", "object": "model", "created",
+"owned_by"}]}`) matches OpenAI's own `GET /v1/models`.
+
+### Using with LiteLLM and other OpenAI-compatible gateways
+
+`POST /v1/chat/completions`, `GET /v1/models`, SSE streaming, and the
+error-object shape all follow OpenAI's wire format closely enough that
+LiteLLM's `openai`/`openai_compatible` provider, Open WebUI, or any other
+tool that treats an `api_base` as a drop-in OpenAI backend can point at
+DevBridge directly. Two things to get right:
+
+1. **`api_base` must be `http://<host>:<port>/v1`**, nothing after it —
+   these clients append `/chat/completions`, `/models`, etc. themselves.
+2. **Network reachability.** DevBridge enforces same-origin/DNS-rebinding
+   protection (see [Non-functional / safety requirements](#non-functional--safety-requirements))
+   by checking the `Host` and `Origin` headers against a fixed allowlist.
+   - If the gateway runs **on the same host** and calls
+     `http://127.0.0.1:3000/v1` or `http://localhost:3000/v1`, this just
+     works — the `Host` header is already loopback, no configuration
+     needed.
+   - If the gateway runs in **its own container** (e.g. the same
+     docker-compose network, reached by service name), its requests arrive
+     with a non-loopback `Host` header and get a `403 forbidden host`
+     until you explicitly trust that one hostname: set
+     `TRUSTED_HOSTS=<gateway-service-name>` (comma-separate more than
+     one). This is a named exception, not a wildcard — everything else is
+     still denied by default.
+   - An API key sent as `Authorization: Bearer <anything>` (LiteLLM always
+     sends one) is accepted and ignored; DevBridge has no credentials of
+     its own to check it against.
 
 ### Known limitations
 
@@ -341,10 +449,14 @@ reconfigure away:
    with `127.0.0.1:` rather than left open on all interfaces.
 3. **Same-origin / DNS-rebinding protection.** Every HTTP route and the WS
    upgrade both check `Host` *and* `Origin` independently against a fixed
-   loopback allowlist (`127.0.0.1`, `localhost`, `::1`), because DNS
-   rebinding can make an attacker-controlled hostname resolve to
-   `127.0.0.1` — comparing `Host` and `Origin` to each other instead of to
-   a fixed allowlist would prove nothing in that scenario.
+   allowlist (`127.0.0.1`, `localhost`, `::1`, plus whatever hostnames
+   `TRUSTED_HOSTS` explicitly names), because DNS rebinding can make an
+   attacker-controlled hostname resolve to `127.0.0.1` — comparing `Host`
+   and `Origin` to each other instead of to a fixed allowlist would prove
+   nothing in that scenario. `TRUSTED_HOSTS` is an opt-in, named exception
+   for a specific trusted peer (e.g. a gateway on a private docker-compose
+   network — see [Using with LiteLLM and other gateways](#using-with-litellm-and-other-openai-compatible-gateways)),
+   never a wildcard; the default allowlist is unchanged.
 4. **Execution timeouts.** No turn runs unbounded: `EXEC_TIMEOUT_MS`
    bounds `/v1/chat/completions` turns (process killed on expiry); the PTY
    debug path has its own readiness/settle timeouts for startup.
