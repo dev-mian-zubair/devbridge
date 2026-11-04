@@ -93,19 +93,20 @@ describe('createSessionStreamHandler', () => {
     expect(ws.send).toHaveBeenCalledWith(JSON.stringify({ type: 'error', data: 'invalid frame' }))
   })
 
-  it('disposes the login session on close if this connection started one', async () => {
+  it('does not dispose the login session on close, even if this connection started one', async () => {
+    // The login PTY is a single shared singleton (loginSession.js) — any
+    // connection that ever sent login:start could be a second tab merely
+    // observing an already-active session, not its owner. Disposing on
+    // close killed a login that had already succeeded (confirmed live: the
+    // CLI printed "Login successful. Press Enter to continue…" and a
+    // transient disconnect — a page reload, a second viewer closing, a
+    // network blip — tore it down before credentials were ever written).
+    // Only an explicit login:complete or the session's own GC timeout may
+    // end it now.
     const ws = fakeWs()
     const loginSession = fakeLoginSession()
     const { onMessage, onClose } = wire(ws, fakeTurnSessions(), fakeEvents(), loginSession)
     await onMessage(JSON.stringify({ type: 'login:start' }))
-    onClose()
-    expect(loginSession.dispose).toHaveBeenCalledTimes(1)
-  })
-
-  it('does not dispose the login session on close if this connection never started one', () => {
-    const ws = fakeWs()
-    const loginSession = fakeLoginSession()
-    const { onClose } = wire(ws, fakeTurnSessions(), fakeEvents(), loginSession)
     onClose()
     expect(loginSession.dispose).not.toHaveBeenCalled()
   })

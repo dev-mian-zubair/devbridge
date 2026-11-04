@@ -8,8 +8,6 @@
 // extracted from raw output, not a real screen.
 export function createSessionStreamHandler({ turnSessions, events, loginSession }) {
   return (ws, _request) => {
-    let startedLogin = false
-
     ws.send(JSON.stringify({ type: 'snapshot', sessions: turnSessions.list() }))
     const unsubscribe = events.subscribe((message) => {
       ws.send(JSON.stringify(message))
@@ -27,7 +25,6 @@ export function createSessionStreamHandler({ turnSessions, events, loginSession 
       const { type, data } = frame ?? {}
 
       if (type === 'login:start') {
-        startedLogin = true
         await loginSession.start((chunk) => {
           ws.send(JSON.stringify({ type: 'login:output', data: chunk }))
         })
@@ -53,10 +50,15 @@ export function createSessionStreamHandler({ turnSessions, events, loginSession 
 
     ws.on('close', () => {
       unsubscribe()
-      // A dashboard tab closing mid-login is exactly the abandonment case
-      // the login session's own GC timeout is a backstop for — disposing
-      // here handles the common case immediately instead of waiting it out.
-      if (startedLogin) loginSession.dispose()
+      // Deliberately does NOT dispose the login session here. It's a single
+      // shared singleton (loginSession.js) — a connection that sent
+      // login:start may just be a second tab observing an already-active
+      // session, not its owner, so "this connection closed" doesn't mean
+      // "the login is abandoned." Confirmed live: a transient disconnect
+      // right after the CLI printed "Login successful. Press Enter to
+      // continue…" tore the session down before credentials were written.
+      // Only an explicit login:complete or the session's own GC timeout
+      // (see loginSession.js) end it now.
     })
   }
 }

@@ -23,9 +23,11 @@ const sessionsById = new Map()
 const liveOutputBySession = new Map()
 let selectedSessionId = null
 
-const URL_PATTERN = /https?:\/\/\S+/
-const CODE_PATTERN = /\b[A-Za-z0-9-]{6,12}\b/
-let loginAwaitingAuth = false
+// Stops at whitespace *and* control bytes (ESC, BEL) — a bare \S+ would
+// happily swallow a trailing escape sequence into the "link" on a
+// hyperlinked/wrapped URL, corrupting it.
+const URL_PATTERN = /https?:\/\/[^\s\x1b\x07]+/
+let loginLinkShown = false
 let loginTerminal = createTerminalBuffer()
 
 const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
@@ -175,7 +177,7 @@ function openLoginOverlay() {
   loginLinkArea.hidden = true
   loginRawOutput.textContent = ''
   loginTerminal = createTerminalBuffer()
-  loginAwaitingAuth = false
+  loginLinkShown = false
   loginInputField.value = ''
   loginInputField.focus()
 }
@@ -204,14 +206,23 @@ function sendLoginKey(data) {
   ws.send(JSON.stringify({ type: 'login:input', data }))
 }
 
-// The CLI's /login flow isn't always just "a URL and code to open" — it
-// can start with a method-selection menu, or other prompts, before (or
-// instead of) ever showing one. The input row above is always available so
-// the user can answer whatever's actually being asked; this just surfaces
-// a URL+code pair prominently as a convenience when one appears, and
-// offers to auto-complete once further output follows it (the same
-// heuristic the old debug terminal used) — "I'm signed in" below covers
-// the case where that heuristic doesn't fire.
+// The CLI's /login flow isn't always just "a URL to open" — it can start
+// with a method-selection menu, or other prompts, before (or instead of)
+// ever showing one. The input row above is always available so the user
+// can answer whatever's actually being asked; this just surfaces the URL
+// prominently as a convenience when one appears.
+//
+// Deliberately NOT auto-completing on "any output after the link looks
+// like progress": this flow doesn't show a short code in the terminal at
+// all (see URL_PATTERN's neighbor comment) — the real code comes back from
+// the browser and the user pastes it into the input field below, which
+// itself produces a CLI response chunk with no URL in it. An earlier
+// version treated exactly that as "must be done" and disposed the login
+// PTY — killing it mid code-exchange, before credentials could be written.
+// Confirmed live: a WS probe sitting idle after the link screen received
+// zero further output for 18s — the CLI only responds to input, so only
+// an explicit "I'm signed in" click (or the GC timeout) ends the session
+// from here now.
 function handleLoginOutput(chunk) {
   // loginTerminal tracks cursor position/erases so a redraw (e.g. an arrow
   // key moving a menu selection) updates the materialized text in place
@@ -221,21 +232,17 @@ function handleLoginOutput(chunk) {
   loginRawOutput.scrollTop = loginRawOutput.scrollHeight
 
   const urlMatch = chunk.match(URL_PATTERN)
-  const codeMatch = chunk.match(CODE_PATTERN)
-  if (urlMatch && codeMatch) {
-    loginAwaitingAuth = true
-    loginStatus.textContent = 'Open this link and authorize, then respond below if asked.'
+  if (urlMatch && !loginLinkShown) {
+    loginLinkShown = true
+    loginStatus.textContent = 'Open this link and authorize. The site will give you a code — paste it below and press Enter.'
     loginUrlLink.href = urlMatch[0]
-    loginUrlLink.textContent = `${urlMatch[0]} (code: ${codeMatch[0]})`
+    loginUrlLink.textContent = urlMatch[0]
     loginLinkArea.hidden = false
-  } else if (loginAwaitingAuth) {
-    loginAwaitingAuth = false
-    completeLogin('Signed in.')
-  } else {
-    // Output is flowing but doesn't (yet) match the URL+code heuristic —
-    // most often the CLI's login-method menu, which needs arrow keys, not a
-    // URL. Without this, the status line sits on "Starting…" forever even
-    // though the session is live and waiting on the user.
+  } else if (!loginLinkShown) {
+    // Output is flowing but doesn't (yet) contain a link — most often the
+    // CLI's login-method menu, which needs arrow keys, not a URL. Without
+    // this, the status line sits on "Starting…" forever even though the
+    // session is live and waiting on the user.
     loginStatus.textContent = 'Waiting for your response — see output below (arrow keys + Enter work in the field).'
   }
 }
