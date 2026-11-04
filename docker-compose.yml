@@ -1,0 +1,15 @@
+services:
+  devbridge:
+    build: .
+    ports:
+      # Host-side loopback bind satisfies the loopback-only security design
+      # (see Dockerfile) — never widen this to "3000:3000".
+      - "127.0.0.1:3000:3000"
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      - claude-config:/data/.claude
+
+volumes:
+  claude-config:

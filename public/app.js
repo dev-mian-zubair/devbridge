@@ -1,3 +1,5 @@
+import { createTerminalBuffer } from './terminalBuffer.js'
+
 const statusBar = document.getElementById('status-bar')
 const projectTree = document.getElementById('project-tree')
 const sessionDetail = document.getElementById('session-detail')
@@ -24,7 +26,7 @@ let selectedSessionId = null
 const URL_PATTERN = /https?:\/\/\S+/
 const CODE_PATTERN = /\b[A-Za-z0-9-]{6,12}\b/
 let loginAwaitingAuth = false
-let loginOutputBuffer = ''
+let loginTerminal = createTerminalBuffer()
 
 const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
 const ws = new WebSocket(`${wsProtocol}//${window.location.host}/api/session/stream`)
@@ -172,7 +174,7 @@ function openLoginOverlay() {
   loginStatus.textContent = 'Starting…'
   loginLinkArea.hidden = true
   loginRawOutput.textContent = ''
-  loginOutputBuffer = ''
+  loginTerminal = createTerminalBuffer()
   loginAwaitingAuth = false
   loginInputField.value = ''
   loginInputField.focus()
@@ -189,10 +191,17 @@ function completeLogin(statusText) {
 }
 
 function sendLoginInput() {
+  // No empty-value guard: the CLI's menus (e.g. the login-method picker) are
+  // navigated with arrow keys and confirmed with a bare Enter — the field is
+  // legitimately empty when that happens, and withholding \r would leave the
+  // selection unconfirmed.
   const value = loginInputField.value
-  if (!value) return
   ws.send(JSON.stringify({ type: 'login:input', data: `${value}\r` }))
   loginInputField.value = ''
+}
+
+function sendLoginKey(data) {
+  ws.send(JSON.stringify({ type: 'login:input', data }))
 }
 
 // The CLI's /login flow isn't always just "a URL and code to open" — it
@@ -204,8 +213,11 @@ function sendLoginInput() {
 // heuristic the old debug terminal used) — "I'm signed in" below covers
 // the case where that heuristic doesn't fire.
 function handleLoginOutput(chunk) {
-  loginOutputBuffer += chunk
-  loginRawOutput.textContent = loginOutputBuffer
+  // loginTerminal tracks cursor position/erases so a redraw (e.g. an arrow
+  // key moving a menu selection) updates the materialized text in place
+  // instead of appending a second copy of the whole screen underneath it.
+  loginTerminal.write(chunk)
+  loginRawOutput.textContent = loginTerminal.render()
   loginRawOutput.scrollTop = loginRawOutput.scrollHeight
 
   const urlMatch = chunk.match(URL_PATTERN)
@@ -219,6 +231,12 @@ function handleLoginOutput(chunk) {
   } else if (loginAwaitingAuth) {
     loginAwaitingAuth = false
     completeLogin('Signed in.')
+  } else {
+    // Output is flowing but doesn't (yet) match the URL+code heuristic —
+    // most often the CLI's login-method menu, which needs arrow keys, not a
+    // URL. Without this, the status line sits on "Starting…" forever even
+    // though the session is live and waiting on the user.
+    loginStatus.textContent = 'Waiting for your response — see output below (arrow keys + Enter work in the field).'
   }
 }
 
@@ -229,7 +247,20 @@ signInButton.addEventListener('click', () => {
 
 loginSendButton.addEventListener('click', sendLoginInput)
 loginInputField.addEventListener('keydown', (event) => {
-  if (event.key === 'Enter') sendLoginInput()
+  if (event.key === 'Enter') {
+    sendLoginInput()
+    return
+  }
+  // The CLI's selection menus (e.g. choosing a login method) are driven by
+  // arrow keys, forwarded immediately rather than batched behind Enter —
+  // same reasoning as sendLoginInput's dropped empty-value guard above.
+  if (event.key === 'ArrowUp') {
+    event.preventDefault()
+    sendLoginKey('\u001b[A')
+  } else if (event.key === 'ArrowDown') {
+    event.preventDefault()
+    sendLoginKey('\u001b[B')
+  }
 })
 
 loginSignedInButton.addEventListener('click', () => {
