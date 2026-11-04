@@ -109,6 +109,7 @@ export function createLoginSession(
     readinessTimeoutMs = 5000,
     readinessSettleMs = 250,
     gcTimeoutMs = 5 * 60 * 1000,
+    disconnectGraceMs = 15 * 1000,
     claudeConfigDir,
     readFileSync = fs.readFileSync,
     writeFileSync = fs.writeFileSync,
@@ -121,6 +122,7 @@ export function createLoginSession(
 
   function cleanup(current) {
     clearTimeout(current.gcTimer)
+    clearTimeout(current.graceTimer)
     removeCwdTrust(claudeConfigDir, current.loginCwd, { readFileSync, writeFileSync })
     try {
       rmSync(current.loginCwd, { recursive: true, force: true })
@@ -145,6 +147,11 @@ export function createLoginSession(
     async start(onOutput) {
       if (active) {
         if (onOutput) active.listeners.add(onOutput)
+        // A reconnect (page reload, a second tab) attaching before the
+        // disconnect grace period (see detach()) elapses means the session
+        // isn't actually abandoned — cancel the pending teardown.
+        clearTimeout(active.graceTimer)
+        active.graceTimer = null
         return
       }
 
@@ -167,7 +174,7 @@ export function createLoginSession(
         env: spawnEnv(),
       })
       const listeners = new Set(onOutput ? [onOutput] : [])
-      const current = { pty, listeners, loginCwd, gcTimer: null }
+      const current = { pty, listeners, loginCwd, gcTimer: null, graceTimer: null }
       active = current
 
       pty.onExit(() => {
@@ -177,7 +184,17 @@ export function createLoginSession(
         }
       })
       pty.onData((chunk) => {
-        for (const listener of listeners) listener(chunk)
+        // One listener's callback throwing (e.g. ws.send() on a socket that
+        // has since closed) must not stop delivery to the others, and must
+        // not escape into node-pty's own event dispatch — same reasoning as
+        // turnEvents.js's subscribe().
+        for (const listener of listeners) {
+          try {
+            listener(chunk)
+          } catch {
+            // Dropped — that listener's connection is no longer reachable.
+          }
+        }
       })
 
       current.gcTimer = setTimeout(dispose, gcTimeoutMs)
@@ -188,6 +205,24 @@ export function createLoginSession(
     },
     input(data) {
       active?.pty.write(data)
+    },
+    // Called when one connection that was watching this session goes away
+    // (its WS closed). Neither extreme is right: disposing the instant any
+    // one connection drops killed a real, already-succeeded login when its
+    // one watching tab closed (see sessionStream.js); never disposing on
+    // disconnect leaves a truly abandoned session alive — and attachable by
+    // a different connection — for the full gcTimeoutMs. A short grace
+    // period threads the needle: start() (a reload, a second tab) cancels
+    // it, so only genuine abandonment reaches it.
+    detach(onOutput) {
+      if (!active) return
+      const current = active
+      current.listeners.delete(onOutput)
+      if (current.listeners.size > 0 || current.graceTimer) return
+      current.graceTimer = setTimeout(() => {
+        if (active === current) dispose()
+      }, disconnectGraceMs)
+      current.graceTimer.unref?.()
     },
     dispose,
     isActive() {

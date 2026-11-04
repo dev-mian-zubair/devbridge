@@ -282,4 +282,76 @@ describe('createLoginSession', () => {
     await vi.advanceTimersByTimeAsync(1001)
     expect(pty.kill).not.toHaveBeenCalled()
   })
+
+  describe('detach() — bounded teardown instead of either extreme', () => {
+    // Neither "kill on the instant any one connection drops" (killed a real,
+    // already-succeeded login when the connection that started it closed —
+    // see sessionStream.js) nor "never kill on disconnect" (leaves a truly
+    // abandoned session alive, and attachable by another connection, for
+    // the full 5-minute GC window) is right. A short grace period threads
+    // the needle: a reload/reconnect survives, true abandonment is cleaned
+    // up promptly.
+    it('does nothing when there is no active session', () => {
+      const session = createLoginSession(vi.fn())
+      expect(() => session.detach(vi.fn())).not.toThrow()
+    })
+
+    it('does not dispose while other listeners remain attached', async () => {
+      vi.useFakeTimers()
+      const { spawnFn, ptys } = fakeSpawnFactory()
+      const session = createLoginSession(spawnFn, { readinessTimeoutMs: 1000, readinessSettleMs: 10, disconnectGraceMs: 1000, ...fakeFsFactory() })
+      const first = vi.fn()
+      const pty = await startAndSignalReady(session, ptys, first)
+      const second = vi.fn()
+      await session.start(second)
+
+      session.detach(first)
+      await vi.advanceTimersByTimeAsync(1001)
+      expect(session.isActive()).toBe(true)
+      expect(pty.kill).not.toHaveBeenCalled()
+    })
+
+    it('disposes after the grace period once the last listener detaches', async () => {
+      vi.useFakeTimers()
+      const { spawnFn, ptys } = fakeSpawnFactory()
+      const session = createLoginSession(spawnFn, { readinessTimeoutMs: 1000, readinessSettleMs: 10, disconnectGraceMs: 1000, ...fakeFsFactory() })
+      const onOutput = vi.fn()
+      const pty = await startAndSignalReady(session, ptys, onOutput)
+
+      session.detach(onOutput)
+      expect(session.isActive()).toBe(true) // not immediate
+      await vi.advanceTimersByTimeAsync(1001)
+      expect(session.isActive()).toBe(false)
+      expect(pty.kill).toHaveBeenCalledTimes(1)
+    })
+
+    it('a reconnect within the grace period cancels the pending disposal', async () => {
+      vi.useFakeTimers()
+      const { spawnFn, ptys } = fakeSpawnFactory()
+      const session = createLoginSession(spawnFn, { readinessTimeoutMs: 1000, readinessSettleMs: 10, disconnectGraceMs: 1000, ...fakeFsFactory() })
+      const onOutput = vi.fn()
+      const pty = await startAndSignalReady(session, ptys, onOutput)
+
+      session.detach(onOutput)
+      await vi.advanceTimersByTimeAsync(500)
+      await session.start(vi.fn()) // reconnect before the 1000ms grace period elapses
+
+      await vi.advanceTimersByTimeAsync(600) // past the original deadline
+      expect(session.isActive()).toBe(true)
+      expect(pty.kill).not.toHaveBeenCalled()
+    })
+  })
+
+  it('a listener that throws does not block delivery to the other listeners', async () => {
+    vi.useFakeTimers()
+    const { spawnFn, ptys } = fakeSpawnFactory()
+    const session = createLoginSession(spawnFn, { readinessTimeoutMs: 1000, readinessSettleMs: 10, ...fakeFsFactory() })
+    const broken = vi.fn(() => { throw new Error('socket closed') })
+    const pty = await startAndSignalReady(session, ptys, broken)
+    const healthy = vi.fn()
+    await session.start(healthy)
+
+    expect(() => pty.emitData('chunk')).not.toThrow()
+    expect(healthy).toHaveBeenCalledWith('chunk')
+  })
 })

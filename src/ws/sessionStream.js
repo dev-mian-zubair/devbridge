@@ -8,6 +8,8 @@
 // extracted from raw output, not a real screen.
 export function createSessionStreamHandler({ turnSessions, events, loginSession }) {
   return (ws, _request) => {
+    let loginOutputListener = null
+
     ws.send(JSON.stringify({ type: 'snapshot', sessions: turnSessions.list() }))
     const unsubscribe = events.subscribe((message) => {
       ws.send(JSON.stringify(message))
@@ -25,9 +27,10 @@ export function createSessionStreamHandler({ turnSessions, events, loginSession 
       const { type, data } = frame ?? {}
 
       if (type === 'login:start') {
-        await loginSession.start((chunk) => {
+        loginOutputListener = (chunk) => {
           ws.send(JSON.stringify({ type: 'login:output', data: chunk }))
-        })
+        }
+        await loginSession.start(loginOutputListener)
         return
       }
 
@@ -50,15 +53,17 @@ export function createSessionStreamHandler({ turnSessions, events, loginSession 
 
     ws.on('close', () => {
       unsubscribe()
-      // Deliberately does NOT dispose the login session here. It's a single
-      // shared singleton (loginSession.js) — a connection that sent
-      // login:start may just be a second tab observing an already-active
-      // session, not its owner, so "this connection closed" doesn't mean
-      // "the login is abandoned." Confirmed live: a transient disconnect
+      // Detach, not dispose: the login PTY is a single shared singleton
+      // (loginSession.js) — this connection may just be a second tab
+      // observing an already-active session, not its owner, so "this
+      // connection closed" doesn't mean "the login is abandoned."
+      // loginSession.detach() only tears the session down after a short
+      // grace period with zero listeners left attached (a reload/second
+      // tab reconnecting cancels it) — see its own comment for why.
+      // Confirmed live: disposing unconditionally here tore down a session
       // right after the CLI printed "Login successful. Press Enter to
-      // continue…" tore the session down before credentials were written.
-      // Only an explicit login:complete or the session's own GC timeout
-      // (see loginSession.js) end it now.
+      // continue…", before credentials were written.
+      if (loginOutputListener) loginSession.detach(loginOutputListener)
     })
   }
 }

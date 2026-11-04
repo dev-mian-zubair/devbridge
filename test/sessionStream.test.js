@@ -16,7 +16,7 @@ function fakeEvents() {
 }
 
 function fakeLoginSession() {
-  return { start: vi.fn(async () => {}), input: vi.fn(), dispose: vi.fn(), isActive: vi.fn(() => false) }
+  return { start: vi.fn(async () => {}), input: vi.fn(), detach: vi.fn(), dispose: vi.fn(), isActive: vi.fn(() => false) }
 }
 
 function wire(ws, turnSessions, events, loginSession) {
@@ -93,22 +93,33 @@ describe('createSessionStreamHandler', () => {
     expect(ws.send).toHaveBeenCalledWith(JSON.stringify({ type: 'error', data: 'invalid frame' }))
   })
 
-  it('does not dispose the login session on close, even if this connection started one', async () => {
-    // The login PTY is a single shared singleton (loginSession.js) — any
-    // connection that ever sent login:start could be a second tab merely
-    // observing an already-active session, not its owner. Disposing on
-    // close killed a login that had already succeeded (confirmed live: the
-    // CLI printed "Login successful. Press Enter to continue…" and a
-    // transient disconnect — a page reload, a second viewer closing, a
-    // network blip — tore it down before credentials were ever written).
-    // Only an explicit login:complete or the session's own GC timeout may
-    // end it now.
+  it('detaches (not disposes) the login session on close if this connection started one', async () => {
+    // The login PTY is a single shared singleton (loginSession.js) — this
+    // connection could be a second tab merely observing an already-active
+    // session, not its owner. Disposing outright on close killed a login
+    // that had already succeeded (confirmed live: the CLI printed "Login
+    // successful. Press Enter to continue…" and a transient disconnect —
+    // a page reload, a second viewer closing, a network blip — tore it
+    // down before credentials were ever written). detach() instead gives
+    // loginSession.js's own bounded grace period a chance to see a
+    // reconnect before actually tearing anything down.
     const ws = fakeWs()
     const loginSession = fakeLoginSession()
     const { onMessage, onClose } = wire(ws, fakeTurnSessions(), fakeEvents(), loginSession)
     await onMessage(JSON.stringify({ type: 'login:start' }))
     onClose()
     expect(loginSession.dispose).not.toHaveBeenCalled()
+    expect(loginSession.detach).toHaveBeenCalledTimes(1)
+    const detachedListener = loginSession.detach.mock.calls[0][0]
+    expect(detachedListener).toBe(loginSession.start.mock.calls[0][0])
+  })
+
+  it('does not call detach on close if this connection never started a login', () => {
+    const ws = fakeWs()
+    const loginSession = fakeLoginSession()
+    const { onClose } = wire(ws, fakeTurnSessions(), fakeEvents(), loginSession)
+    onClose()
+    expect(loginSession.detach).not.toHaveBeenCalled()
   })
 
   it('unsubscribes from the event bus on close', () => {
