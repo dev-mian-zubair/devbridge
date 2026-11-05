@@ -11,6 +11,7 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
     "express": "^4.21.2",
     "node-pty": "^1.0.0",
     "ws": "^8.18.0"
