@@ -1,6 +1,7 @@
 import { Router } from 'express'
 import { withTimeout } from '../timeoutGuard.js'
 import { SessionConflictError, InvalidProjectPathError } from '../turnSessions.js'
+import { extractText, serializeHistory } from '../historySerializer.js'
 
 // A model/alias name becomes a `--model <value>` argv element, which Node's
 // spawn() rejects synchronously if it contains a NUL byte (ERR_INVALID_ARG_VALUE).
@@ -13,17 +14,6 @@ const MODEL_PATTERN = /^[\w.\-:]+$/
 // equivalent to map onto.
 const CLI_EFFORT_LEVELS = new Set(['low', 'medium', 'high', 'xhigh', 'max'])
 
-function extractText(content) {
-  if (typeof content === 'string') return content
-  if (Array.isArray(content)) {
-    return content
-      .filter((part) => part?.type === 'text' && typeof part.text === 'string')
-      .map((part) => part.text)
-      .join('')
-  }
-  return null
-}
-
 function validateRequest(body, sessionId, projectPath) {
   if (typeof sessionId !== 'string' || sessionId.length === 0) {
     return { error: 'sessionId is required, as the X-Session-Id header or a body field' }
@@ -35,29 +25,37 @@ function validateRequest(body, sessionId, projectPath) {
     return { error: 'a non-empty messages array with a last message of text content is required' }
   }
 
-  const lastMessage = body.messages[body.messages.length - 1]
-  const content = extractText(lastMessage?.content)
-  if (content === null || content.length === 0) {
-    return { error: 'the last message must have non-empty text content' }
+  const content = serializeHistory(body.messages)
+  if (content.length === 0) {
+    return { error: 'the message history must serialize to non-empty content' }
   }
 
   if (body.model !== undefined && (typeof body.model !== 'string' || !MODEL_PATTERN.test(body.model))) {
     return { error: 'model must contain only letters, numbers, dots, hyphens, underscores, or colons' }
   }
 
-  // tools/tool_choice/functions/function_call: a genuine capability gap, not
-  // a field we can safely no-op. OpenAI's tool calling is "client executes":
-  // the model proposes arguments, the caller runs the function and reports
-  // back. The CLI's own tools (Bash, Edit, ...) execute inline, inside a
-  // single turn, with no client-defined-function hook and no point where it
-  // pauses to wait for a result. Silently ignoring these would let a client
-  // that expects a tool_calls response instead get an ordinary text reply
-  // and misread that as "the model chose not to call anything."
-  if (Array.isArray(body.tools) && body.tools.length > 0) {
-    return { error: 'tools is not supported: the CLI executes its own built-in tools inline and cannot call client-defined functions' }
+  // tools: a client-declared tool is bridged through a per-request MCP stub
+  // server and intercepted before the CLI would ever dispatch to it — see
+  // mcpBridge.js/claudeCliRunner.js. tool_choice only maps cleanly onto
+  // "offer the tools" (auto, the default) or "don't" (none); "required" or
+  // a forced named tool has no clean CLI-side equivalent, so it stays a
+  // clear 400 rather than a silent best-effort. functions/function_call
+  // (the deprecated aliases) are out of scope and stay rejected outright.
+  if (Array.isArray(body.tools)) {
+    for (const tool of body.tools) {
+      if (tool?.type !== 'function' || typeof tool.function?.name !== 'string' || tool.function.name.length === 0) {
+        return { error: 'each tools entry must be {type: "function", function: {name, ...}}' }
+      }
+    }
+    // JSON.stringify escapes a literal NUL byte as the 6-character sequence
+    // \u0000 rather than preserving the raw byte, so detecting it means
+    // checking for that escaped form, not a literal '\0' in the output.
+    if (JSON.stringify(body.tools).includes('\\u0000')) {
+      return { error: 'tools must not contain a NUL byte' }
+    }
   }
-  if (body.tool_choice !== undefined && body.tool_choice !== 'none') {
-    return { error: 'tool_choice is not supported: the CLI executes its own built-in tools inline and cannot call client-defined functions' }
+  if (body.tool_choice !== undefined && body.tool_choice !== 'auto' && body.tool_choice !== 'none') {
+    return { error: 'tool_choice must be one of auto, none — required/forced-tool selection is not supported' }
   }
   if (Array.isArray(body.functions) && body.functions.length > 0) {
     return { error: 'functions is not supported (deprecated alias of tools)' }
@@ -129,7 +127,9 @@ function validateRequest(body, sessionId, projectPath) {
     return { error: 'response_format.json_schema must not contain a NUL byte' }
   }
 
-  return { content, systemPrompt, effort, jsonSchema }
+  const activeTools = body.tool_choice === 'none' || !Array.isArray(body.tools) || body.tools.length === 0 ? null : body.tools
+
+  return { content, systemPrompt, effort, jsonSchema, tools: activeTools }
 }
 
 // Claude Code's own usage accounting splits input tokens into a fresh
@@ -150,7 +150,12 @@ function mapUsage(usage) {
 
 function mapFinishReason(stopReason) {
   if (stopReason === 'max_tokens') return 'length'
+  if (stopReason === 'tool_use') return 'tool_calls'
   return 'stop'
+}
+
+function mapToolCalls(toolCalls) {
+  return toolCalls.map((tc) => ({ id: tc.id, type: 'function', function: { name: tc.name, arguments: tc.arguments } }))
 }
 
 function sseWrite(res, payload) {
@@ -184,7 +189,7 @@ export function createChatCompletionsRouter({ sessions, runner, timeoutMs, event
     }
 
     const { model } = req.body
-    const { content, systemPrompt, effort, jsonSchema } = validation
+    const { content, systemPrompt, effort, jsonSchema, tools } = validation
     const stream = req.body.stream === true
 
     let session
@@ -222,7 +227,7 @@ export function createChatCompletionsRouter({ sessions, runner, timeoutMs, event
       systemPrompt,
       effort,
       jsonSchema,
-      claudeSessionId: session.claudeSessionId ?? undefined,
+      tools,
     }
 
     if (stream) {
@@ -231,6 +236,12 @@ export function createChatCompletionsRouter({ sessions, runner, timeoutMs, event
         onDelta: (text) => {
           sseWrite(res, { id, object: 'chat.completion.chunk', created, model: model ?? 'claude-code-local', choices: [{ index: 0, delta: { content: text }, finish_reason: null, logprobs: null }] })
           publishDelta(text)
+        },
+        onToolCallDelta: ({ index, id: toolCallId, name, argumentsFragment }) => {
+          const delta = toolCallId !== undefined
+            ? { index, id: toolCallId, type: 'function', function: { name, arguments: argumentsFragment } }
+            : { index, function: { arguments: argumentsFragment } }
+          sseWrite(res, { id, object: 'chat.completion.chunk', created, model: model ?? 'claude-code-local', choices: [{ index: 0, delta: { tool_calls: [delta] }, finish_reason: null, logprobs: null }] })
         },
       })
       // The lock is released once the underlying process has actually
@@ -296,6 +307,9 @@ export function createChatCompletionsRouter({ sessions, runner, timeoutMs, event
       }
 
       sessions.recordResult(sessionId, { content: result.text, finishReason: mapFinishReason(result.stopReason), usage: mapUsage(result.usage) })
+      const message = result.toolCalls?.length
+        ? { role: 'assistant', content: null, tool_calls: mapToolCalls(result.toolCalls), refusal: null }
+        : { role: 'assistant', content: result.text, refusal: null }
       return res.json({
         id,
         object: 'chat.completion',
@@ -304,7 +318,7 @@ export function createChatCompletionsRouter({ sessions, runner, timeoutMs, event
         choices: [
           {
             index: 0,
-            message: { role: 'assistant', content: result.text, refusal: null },
+            message,
             finish_reason: mapFinishReason(result.stopReason),
             logprobs: null,
           },

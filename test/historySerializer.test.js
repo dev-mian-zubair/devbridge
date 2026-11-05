@@ -74,4 +74,9 @@ describe('serializeHistory', () => {
     expect(() => serializeHistory(messages)).not.toThrow()
     expect(serializeHistory(messages)).toContain('Tool result (call_id: call_orphan): some result')
   })
+
+  it('serializes a message with empty string content to nothing, not a bare role label', () => {
+    expect(serializeHistory([{ role: 'user', content: '' }])).toBe('')
+    expect(serializeHistory([{ role: 'assistant', content: '' }])).toBe('')
+  })
 })

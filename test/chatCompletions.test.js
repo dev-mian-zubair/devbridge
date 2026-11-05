@@ -86,6 +86,28 @@ describe('POST /v1/chat/completions', () => {
     expect(res.body.choices[0].finish_reason).toBe('stop')
   })
 
+  it('a tool_use outcome produces a tool_calls response with finish_reason tool_calls', async () => {
+    const runner = fakeRunner()
+    const { app } = appWith(runner)
+    const reqPromise = request(app).post('/v1/chat/completions').send({
+      sessionId: 's1', projectPath: '/app/workspace/proj',
+      messages: [{ role: 'user', content: 'weather in paris?' }],
+      tools: [{ type: 'function', function: { name: 'get_weather', parameters: { type: 'object' } } }],
+    })
+    const [res] = await Promise.all([
+      reqPromise,
+      waitForPending(runner).then(() => runner.pending[0].resolve(outcome({
+        text: '', stopReason: 'tool_use', toolCalls: [{ index: 0, id: 'toolu_1', name: 'get_weather', arguments: '{"location":"Paris"}' }],
+      }))),
+    ])
+    expect(res.status).toBe(200)
+    expect(res.body.choices[0].finish_reason).toBe('tool_calls')
+    expect(res.body.choices[0].message.tool_calls).toEqual([
+      { id: 'toolu_1', type: 'function', function: { name: 'get_weather', arguments: '{"location":"Paris"}' } },
+    ])
+    expect(res.body.choices[0].message.content).toBeNull()
+  })
+
   it('maps usage into prompt_tokens/completion_tokens/total_tokens', async () => {
     const runner = fakeRunner()
     const { app } = appWith(runner)
@@ -121,34 +143,10 @@ describe('POST /v1/chat/completions', () => {
     runner.pending[0].resolve(outcome())
     await reqPromise
 
-    expect(runner.pending[0].opts.content).toBe('hello')
+    expect(runner.pending[0].opts.content).toBe('User: first\n\nAssistant: ack\n\nUser: hello')
     expect(runner.pending[0].opts.projectPath).toBe('/app/workspace/proj')
     expect(runner.pending[0].opts.model).toBe('opus')
     expect(runner.pending[0].opts.systemPrompt).toBe('Be terse.')
-    expect(runner.pending[0].opts.claudeSessionId).toBeUndefined()
-  })
-
-  it('resumes with the claudeSessionId stored from the previous turn', async () => {
-    const runner = fakeRunner()
-    const { app } = appWith(runner)
-
-    const first = request(app).post('/v1/chat/completions').send({
-      sessionId: 's1', projectPath: '/app/workspace/proj', messages: [{ role: 'user', content: 'hello' }],
-    })
-    first.catch(() => {})
-    await waitForPending(runner, 1)
-    runner.pending[0].resolve(outcome({ claudeSessionId: 'claude-uuid-1' }))
-    await first
-
-    const second = request(app).post('/v1/chat/completions').send({
-      sessionId: 's1', projectPath: '/app/workspace/proj', messages: [{ role: 'user', content: 'again' }],
-    })
-    second.catch(() => {})
-    await waitForPending(runner, 2)
-    runner.pending[1].resolve(outcome({ claudeSessionId: 'claude-uuid-1' }))
-    await second
-
-    expect(runner.pending[1].opts.claudeSessionId).toBe('claude-uuid-1')
   })
 
   describe('X-Session-Id / X-Project-Path headers', () => {
@@ -227,7 +225,7 @@ describe('POST /v1/chat/completions', () => {
     await waitForPending(runner)
     runner.pending[0].resolve(outcome())
     await reqPromise
-    expect(runner.pending[0].opts.content).toBe('hello world')
+    expect(runner.pending[0].opts.content).toBe('User: hello world')
   })
 
   it('rejects a model value with characters outside a safe alias charset', async () => {
@@ -439,28 +437,6 @@ describe('POST /v1/chat/completions', () => {
       expect(runner.pending[0].opts.systemPrompt).toBe('Be terse.')
     })
 
-    it('rejects a request with a non-empty tools array', async () => {
-      const runner = fakeRunner()
-      const { app } = appWith(runner)
-      const res = await request(app).post('/v1/chat/completions').send({
-        sessionId: 's1', projectPath: '/app/workspace/proj', tools: [{ type: 'function', function: { name: 'f' } }],
-        messages: [{ role: 'user', content: 'hi' }],
-      })
-      expect(res.status).toBe(400)
-      expect(res.body.error.type).toBe('invalid_request_error')
-    })
-
-    it('rejects a request with tool_choice other than "none"', async () => {
-      const runner = fakeRunner()
-      const { app } = appWith(runner)
-      const res = await request(app).post('/v1/chat/completions').send({
-        sessionId: 's1', projectPath: '/app/workspace/proj', tool_choice: 'auto',
-        messages: [{ role: 'user', content: 'hi' }],
-      })
-      expect(res.status).toBe(400)
-      expect(res.body.error.type).toBe('invalid_request_error')
-    })
-
     it('rejects a request with a non-empty functions array (deprecated alias of tools)', async () => {
       const runner = fakeRunner()
       const { app } = appWith(runner)
@@ -470,6 +446,90 @@ describe('POST /v1/chat/completions', () => {
       })
       expect(res.status).toBe(400)
       expect(res.body.error.type).toBe('invalid_request_error')
+    })
+
+    it('accepts a request with tools and tool_choice auto', async () => {
+      const runner = fakeRunner()
+      const { app } = appWith(runner)
+      const reqPromise = request(app).post('/v1/chat/completions').send({
+        sessionId: 's1', projectPath: '/app/workspace/proj',
+        messages: [{ role: 'user', content: 'weather in paris?' }],
+        tools: [{ type: 'function', function: { name: 'get_weather', parameters: { type: 'object' } } }],
+        tool_choice: 'auto',
+      })
+      reqPromise.catch(() => {})
+      await waitForPending(runner)
+      expect(runner.pending[0].opts.tools).toEqual([{ type: 'function', function: { name: 'get_weather', parameters: { type: 'object' } } }])
+    })
+
+    it('rejects tool_choice: "required" with 400', async () => {
+      const runner = fakeRunner()
+      const { app } = appWith(runner)
+      const res = await request(app).post('/v1/chat/completions').send({
+        sessionId: 's1', projectPath: '/app/workspace/proj',
+        messages: [{ role: 'user', content: 'hi' }],
+        tools: [{ type: 'function', function: { name: 'get_weather' } }],
+        tool_choice: 'required',
+      })
+      expect(res.status).toBe(400)
+    })
+
+    it('rejects a tool with a NUL byte in its name with 400 (Review Focus)', async () => {
+      const runner = fakeRunner()
+      const { app } = appWith(runner)
+      const res = await request(app).post('/v1/chat/completions').send({
+        sessionId: 's1', projectPath: '/app/workspace/proj',
+        messages: [{ role: 'user', content: 'hi' }],
+        tools: [{ type: 'function', function: { name: 'bad\0name' } }],
+      })
+      expect(res.status).toBe(400)
+      expect(runner.pending).toHaveLength(0)
+    })
+
+    it('tool_choice "none" does not pass tools through to the runner, even if tools is non-empty', async () => {
+      const runner = fakeRunner()
+      const { app } = appWith(runner)
+      const reqPromise = request(app).post('/v1/chat/completions').send({
+        sessionId: 's1', projectPath: '/app/workspace/proj',
+        messages: [{ role: 'user', content: 'hi' }],
+        tools: [{ type: 'function', function: { name: 'get_weather' } }],
+        tool_choice: 'none',
+      })
+      reqPromise.catch(() => {})
+      await waitForPending(runner)
+      expect(runner.pending[0].opts.tools).toBeFalsy()
+    })
+
+    it('passes the full serialized history, not just the last message, to the runner', async () => {
+      const runner = fakeRunner()
+      const { app } = appWith(runner)
+      const reqPromise = request(app).post('/v1/chat/completions').send({
+        sessionId: 's1', projectPath: '/app/workspace/proj',
+        messages: [
+          { role: 'user', content: 'first' },
+          { role: 'assistant', content: 'ack' },
+          { role: 'user', content: 'second' },
+        ],
+      })
+      reqPromise.catch(() => {})
+      await waitForPending(runner)
+      expect(runner.pending[0].opts.content).toBe('User: first\n\nAssistant: ack\n\nUser: second')
+    })
+
+    it('accepts a request whose last message is a tool result (Review Focus: no longer requires text as the last message)', async () => {
+      const runner = fakeRunner()
+      const { app } = appWith(runner)
+      const reqPromise = request(app).post('/v1/chat/completions').send({
+        sessionId: 's1', projectPath: '/app/workspace/proj',
+        messages: [
+          { role: 'user', content: 'weather?' },
+          { role: 'assistant', content: null, tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'get_weather', arguments: '{}' } }] },
+          { role: 'tool', tool_call_id: 'call_1', content: 'sunny' },
+        ],
+      })
+      reqPromise.catch(() => {})
+      await waitForPending(runner)
+      expect(runner.pending).toHaveLength(1)
     })
 
     it('rejects a request with n greater than 1', async () => {
@@ -627,7 +687,7 @@ describe('POST /v1/chat/completions', () => {
       reqPromise.catch(() => {})
       await waitForPending(runner)
       expect(sessions.get('s1').status).toBe('running')
-      expect(sessions.get('s1').lastRequest).toEqual({ model: 'opus', messageCount: 1, lastUserMessage: 'hi' })
+      expect(sessions.get('s1').lastRequest).toEqual({ model: 'opus', messageCount: 1, lastUserMessage: 'User: hi' })
       runner.pending[0].resolve(outcome())
       await reqPromise
     })
@@ -710,6 +770,32 @@ describe('POST /v1/chat/completions', () => {
       expect(contentChunks.map((c) => c.choices[0].delta.content)).toEqual(['Hi ', 'there!'])
       const lastChunk = chunks[chunks.length - 1]
       expect(lastChunk.choices[0].finish_reason).toBe('stop')
+    })
+
+    it('streams tool_call deltas: first chunk carries id/type/function.name, later chunks carry only arguments fragments', async () => {
+      const runner = fakeRunner()
+      const { app } = appWith(runner)
+      const reqPromise = request(app).post('/v1/chat/completions').send({
+        sessionId: 's1', projectPath: '/app/workspace/proj', stream: true,
+        messages: [{ role: 'user', content: 'weather in paris?' }],
+        tools: [{ type: 'function', function: { name: 'get_weather' } }],
+      })
+      const [res] = await Promise.all([
+        reqPromise,
+        waitForPending(runner).then(async () => {
+          const { opts, resolve } = runner.pending[0]
+          opts.onToolCallDelta({ index: 0, id: 'toolu_1', name: 'get_weather', argumentsFragment: '' })
+          opts.onToolCallDelta({ index: 0, argumentsFragment: '{"location":"Paris"}' })
+          resolve(outcome({ text: '', stopReason: 'tool_use', toolCalls: [{ index: 0, id: 'toolu_1', name: 'get_weather', arguments: '{"location":"Paris"}' }] }))
+        }),
+      ])
+      const events = parseSseEvents(res.text).filter((e) => e !== '[DONE]').map((e) => JSON.parse(e))
+      const toolChunks = events.filter((e) => e.choices?.[0]?.delta?.tool_calls)
+      expect(toolChunks[0].choices[0].delta.tool_calls).toEqual([
+        { index: 0, id: 'toolu_1', type: 'function', function: { name: 'get_weather', arguments: '' } },
+      ])
+      expect(toolChunks[1].choices[0].delta.tool_calls).toEqual([{ index: 0, function: { arguments: '{"location":"Paris"}' } }])
+      expect(events.at(-1).choices[0].finish_reason).toBe('tool_calls')
     })
 
     it('includes a trailing usage chunk when stream_options.include_usage is true', async () => {

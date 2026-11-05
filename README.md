@@ -56,10 +56,16 @@ different interfaces, because the two jobs it does are genuinely different:
     runs unattended here exactly as it would in an interactive session. A
     tool invocation that just hangs (not a permission prompt) is bounded
     only by `EXEC_TIMEOUT_MS`, the same as everything else.
-  - Multi-turn continuity uses the CLI's own `--session-id` on a fresh
-    turn and `--resume <id>` on later ones — there's no long-lived process
-    kept around between requests; each turn is a fresh `spawn()` that exits
-    when it's done.
+  - Multi-turn continuity comes from replaying the full `messages` array
+    into every turn's prompt, not from CLI-side session state: there's no
+    `--session-id`/`--resume`, and no long-lived process kept around
+    between requests — each turn is a fresh `spawn()` that exits when it's
+    done, with the whole conversation (including any prior tool calls and
+    their results) serialized into that one turn's stdin. This matches the
+    real OpenAI API's own statelessness — the client resends history, the
+    server holds none of it — which is also what makes tool calling (below)
+    possible at all: a tool's result only ever exists in the client's own
+    message list.
 - **The dashboard's login flow** (`WS /api/session/stream`, `login:*`
   frames) still drives a real interactive session through `node-pty`,
   because completing the `/login` device-code flow genuinely needs one —
@@ -261,15 +267,21 @@ curl http://127.0.0.1:3000/v1/chat/completions \
   picked up the turn, so it echoes back whatever alias you requested.
 - Any `role: "system"` messages are joined (`\n\n`-separated) and sent as
   `--append-system-prompt`.
-- Only the *last* message's `content` becomes the new turn's prompt —
-  earlier `user`/`assistant` messages aren't replayed, because the CLI
-  session itself (resumed via `--session-id`/`--resume`) already has that
-  history. Send the full OpenAI-style running transcript if you like; only
-  its last entry and any `system` entries are used.
+- The entire `messages` array (minus `system`/`developer` entries, handled
+  separately above) is replayed into the new turn's prompt, every call —
+  every prior `user`/`assistant` message, any `assistant` message's
+  `tool_calls`, and any `tool`-role result. There's no CLI-side session to
+  hold that history instead: send the full OpenAI-style running transcript
+  every time, exactly as you would against the real API.
 - `content` may be a plain string or an OpenAI-style array of
-  `{"type": "text", "text": "..."}` parts, which are concatenated.
+  `{"type": "text", "text": "..."}` parts, which are concatenated. A
+  message with genuinely empty text content contributes nothing to the
+  replayed prompt (not an empty role label).
 - `role: "developer"` messages are treated identically to `role: "system"`
   (OpenAI's newer name for the same thing).
+- `role: "tool"` messages (a `tool_call_id` plus the function's result)
+  are replayed as part of the history — this is how a client's tool-call
+  loop continues the conversation after executing a call itself.
 
 **Response fields**
 
@@ -294,7 +306,7 @@ falls into one of four buckets:
 
 | Supported & mapped | Accepted, silently ignored | Mapped to a real CLI flag | Rejected (400) |
 |---|---|---|---|
-| `model`, `messages`, `stream`, `stream_options.include_usage` | `temperature`, `top_p`, `frequency_penalty`, `presence_penalty`, `logit_bias`, `seed`, `user`/`prompt_cache_key`, `metadata`, `store`, `service_tier`, `prediction`, `moderation`, `parallel_tool_calls`, `safety_identifier`, `max_tokens`/`max_completion_tokens`, `modalities: ["text"]`, `logprobs: false` | `reasoning_effort` → `--effort`; `response_format` (`json_schema` variant) → `--json-schema` | `tools`, `tool_choice`, `functions`, `function_call`, `n > 1`, `logprobs: true`, `top_logprobs`, `modalities` containing anything other than `"text"`, `audio` |
+| `model`, `messages`, `stream`, `stream_options.include_usage`, `tools`, `tool_choice` (`auto`/`none` only) | `temperature`, `top_p`, `frequency_penalty`, `presence_penalty`, `logit_bias`, `seed`, `user`/`prompt_cache_key`, `metadata`, `store`, `service_tier`, `prediction`, `moderation`, `parallel_tool_calls`, `safety_identifier`, `max_tokens`/`max_completion_tokens`, `modalities: ["text"]`, `logprobs: false` | `reasoning_effort` → `--effort`; `response_format` (`json_schema` variant) → `--json-schema`; `tools` → a per-request `--mcp-config` (see below) | `tool_choice: "required"` or a forced named tool, `functions`, `function_call`, `n > 1`, `logprobs: true`, `top_logprobs`, `modalities` containing anything other than `"text"`, `audio` |
 
 **Why `logprobs`/`modalities` are conditionally rejected, not just ignored**:
 both default to the CLI's actual behavior (no logprobs, text-only), so the
@@ -329,20 +341,36 @@ gets back content that validates against it). `"text"` (the default) and
 user message"), so nothing is lost by not enforcing it here either.
 `response_format.json_schema` without a `schema` field is a 400.
 
-**Why `tools`/`tool_choice`/`functions` are rejected outright, not
-ignored**: OpenAI's tool calling is a *client-executes* contract — the
+**How `tools` actually works: an MCP bridge, not an agent-executes
+shortcut**. OpenAI's tool calling is a *client-executes* contract — the
 model proposes `tool_calls` with arguments, the caller runs the real
 function and reports the result back in a follow-up request. The CLI's own
 tools (Bash, Edit, Read, ...) are *agent-executes*: they run inline, inside
 a single turn, the moment the agent decides to use them, with no point
-where it pauses and waits for a caller-supplied result. There's no safe way
-to no-op this: a client that expects `tool_calls` back and instead silently
-gets an ordinary text reply could easily misread that as "the model chose
-not to call anything," which is worse than a clear 400. (The CLI *can* load
-MCP servers via `--mcp-config`, so a real bridge — the CLI calling out
-mid-turn to a server that forwards to the HTTP client and waits for a
-result — is possible in principle, but that's a standalone feature, not a
-field mapping.)
+where it pauses and waits for a caller-supplied result — that mismatch is
+still real and is why `functions`/`function_call` (the deprecated OpenAI
+aliases) stay rejected outright, rather than quietly mapped onto something
+that behaves differently.
+
+For `tools`/`tool_choice`, the gap is closed instead of worked around:
+each `tools` entry is registered as a tool on a per-request stub MCP
+server (`--mcp-config`/`--strict-mcp-config`/`--allowedTools`), reporting
+the client's real JSON Schema so the model proposes correctly-shaped
+arguments. That stub's own tool handler is never meant to actually run —
+the moment the CLI's stream reports a client tool call fully formed
+(`message_delta` with `stop_reason: "tool_use"`), the CLI process is
+killed before it would ever dispatch to the stub, and the proposed
+`tool_calls` (name + arguments, assembled from the same `input_json_delta`
+events Claude's own native tool-use streaming uses) are returned to the
+client with `finish_reason: "tool_calls"` — exactly where real OpenAI
+stops, before any execution. The client executes the tool itself and
+calls back with the result appended to `messages`, same as it would
+against the real API. CLI-native tool use (Bash, Edit, ...) in the same
+turn runs and completes normally — it was never represented in the OpenAI
+response shape anyway — and only a client-declared call ever stops the
+turn. `tool_choice: "required"` or a forced named tool is rejected (400):
+there's no CLI-side way to force a specific call rather than just offering
+the tools, so a clear error beats a silent best-effort.
 
 **Streaming**
 
@@ -417,13 +445,12 @@ DevBridge directly. Two things to get right:
 
 ### Known limitations
 
-- The `sessionId -> claudeSessionId` mapping lives in memory only.
-  Restart the container (or crash before a session's very first turn
-  completes) and that `sessionId` starts a brand-new CLI conversation on
-  its next request — this is a deliberate choice over optimistically
-  guessing at a CLI session id that might not actually exist yet to
-  `--resume`, which would turn a recoverable "starts fresh" outcome into a
-  permanent "every future request for this sessionId fails" one.
+- Full-history replay means every call reprocesses the whole conversation
+  from scratch on the CLI side — there's no server-side prompt-cache reuse
+  across a growing conversation the way `--resume` gave you before. This
+  is the correct tradeoff for matching real OpenAI semantics (the client
+  owns history, the server holds none of it), not an oversight, but it is
+  real added cost on a long conversation.
 - A long-running turn that's actively streaming is still bounded by the
   same flat `EXEC_TIMEOUT_MS` as everything else, not an idle timer reset
   on each token — a legitimately long agentic turn can hit it.

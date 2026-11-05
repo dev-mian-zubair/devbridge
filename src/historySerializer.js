@@ -28,10 +28,12 @@ function renderMessage(message) {
   }
 
   if (role === 'assistant') {
-    return `Assistant: ${extractText(content)}\n\n`
+    const text = extractText(content)
+    return text ? `Assistant: ${text}\n\n` : ''
   }
 
-  return `User: ${extractText(content)}\n\n`
+  const text = extractText(content)
+  return text ? `User: ${text}\n\n` : ''
 }
 
 export function serializeHistory(messages) {
