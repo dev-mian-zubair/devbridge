@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process'
-import crypto from 'node:crypto'
+import { createMcpBridge as realCreateMcpBridge } from './mcpBridge.js'
 
 // Claude Code's `-p/--print` mode is its officially supported non-interactive
 // interface: `--output-format stream-json --include-partial-messages` emits
@@ -16,15 +16,16 @@ import crypto from 'node:crypto'
 // — tools already allow-listed by the user's own Claude Code settings still
 // run unattended, exactly as they would in an interactive session; only the
 // prompts that would otherwise block on a human are turned into denials.
-// --session-id/--resume map directly onto this proxy's own sessionId for
-// multi-turn continuity, without needing to keep a process alive between
-// turns the way the PTY-based approach did.
+// No --session-id/--resume: continuity comes from replaying the full
+// message history into every turn's prompt (see historySerializer.js),
+// matching the real OpenAI API's statelessness instead of relying on
+// CLI-side session state.
 function spawnEnv() {
   const { ANTHROPIC_API_KEY, ...rest } = process.env
   return rest
 }
 
-function buildArgs({ claudeSessionId, model, systemPrompt, effort, jsonSchema, freshSessionId }) {
+function buildArgs({ model, systemPrompt, effort, jsonSchema, mcpConfigPath, allowedToolNames }) {
   const args = [
     '-p',
     '--output-format',
@@ -38,10 +39,8 @@ function buildArgs({ claudeSessionId, model, systemPrompt, effort, jsonSchema, f
   if (systemPrompt) args.push('--append-system-prompt', systemPrompt)
   if (effort) args.push('--effort', effort)
   if (jsonSchema) args.push('--json-schema', JSON.stringify(jsonSchema))
-  if (claudeSessionId) {
-    args.push('--resume', claudeSessionId)
-  } else {
-    args.push('--session-id', freshSessionId)
+  if (mcpConfigPath) {
+    args.push('--mcp-config', mcpConfigPath, '--strict-mcp-config', '--allowedTools', ...allowedToolNames)
   }
   return args
 }
@@ -69,12 +68,20 @@ function signalProcessGroup(child, signal) {
   }
 }
 
-export function createClaudeCliRunner(spawnFn = spawn, { killGraceMs = 5000 } = {}) {
+export function createClaudeCliRunner(spawnFn = spawn, { killGraceMs = 5000, createMcpBridge = realCreateMcpBridge } = {}) {
   return {
-    runTurn({ content, projectPath, claudeSessionId, model, systemPrompt, effort, jsonSchema, onDelta }) {
-      const freshSessionId = claudeSessionId ? undefined : crypto.randomUUID()
-      const args = buildArgs({ claudeSessionId, model, systemPrompt, effort, jsonSchema, freshSessionId })
-      const chosenSessionId = claudeSessionId ?? freshSessionId
+    runTurn({ content, projectPath, model, systemPrompt, effort, jsonSchema, tools, onDelta }) {
+      let mcpConfigPath = null
+      let allowedToolNames = []
+      let cleanupMcpBridge = null
+      if (tools?.length) {
+        const bridge = createMcpBridge(tools)
+        mcpConfigPath = bridge.mcpConfigPath
+        allowedToolNames = bridge.allowedToolNames
+        cleanupMcpBridge = bridge.cleanup
+      }
+
+      const args = buildArgs({ model, systemPrompt, effort, jsonSchema, mcpConfigPath, allowedToolNames })
 
       let child
       try {
@@ -85,7 +92,7 @@ export function createClaudeCliRunner(spawnFn = spawn, { killGraceMs = 5000 } = 
         // must never escape runTurn() — nothing here would catch it, and an
         // uncaught exception takes the whole server down (Node exits on an
         // unhandled rejection too, which this would otherwise become).
-        return { promise: Promise.reject(err), kill: () => {}, claudeSessionId: chosenSessionId }
+        return { promise: Promise.reject(err), kill: () => {} }
       }
 
       let buffered = ''
@@ -96,6 +103,7 @@ export function createClaudeCliRunner(spawnFn = spawn, { killGraceMs = 5000 } = 
 
       child.on('close', () => {
         exited = true
+        cleanupMcpBridge?.()
       })
 
       const promise = new Promise((resolve, reject) => {
@@ -137,7 +145,7 @@ export function createClaudeCliRunner(spawnFn = spawn, { killGraceMs = 5000 } = 
               text: event.result ?? '',
               usage: event.usage ?? null,
               totalCostUsd: event.total_cost_usd ?? null,
-              claudeSessionId: event.session_id ?? chosenSessionId,
+              claudeSessionId: event.session_id ?? null,
               isError: Boolean(event.is_error),
               stopReason: event.stop_reason ?? null,
               subtype: event.subtype ?? null,
@@ -193,7 +201,6 @@ export function createClaudeCliRunner(spawnFn = spawn, { killGraceMs = 5000 } = 
 
       return {
         promise,
-        claudeSessionId: chosenSessionId,
         kill: () => {
           if (exited) return
           signalProcessGroup(child, 'SIGTERM')

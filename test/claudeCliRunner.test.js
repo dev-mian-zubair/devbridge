@@ -53,7 +53,7 @@ describe('createClaudeCliRunner', () => {
     vi.restoreAllMocks()
   })
 
-  it('spawns claude in print/stream-json mode with a fresh --session-id when none is given', () => {
+  it('spawns claude in print/stream-json mode', () => {
     const child = fakeChild()
     const spawnFn = vi.fn(() => child)
     const runner = createClaudeCliRunner(spawnFn)
@@ -72,25 +72,63 @@ describe('createClaudeCliRunner', () => {
         '--verbose',
         '--permission-prompts',
         'none',
-        '--session-id',
       ])
     )
-    expect(args).not.toContain('--resume')
-    const sessionIdIndex = args.indexOf('--session-id') + 1
-    expect(args[sessionIdIndex]).toMatch(/^[0-9a-f-]{36}$/)
     expect(opts.cwd).toBe('/app/workspace/proj')
   })
 
-  it('returns the --session-id it generated synchronously, before the turn settles', () => {
+  it('never passes --session-id or --resume (continuity comes from full-history replay)', () => {
     const child = fakeChild()
     const spawnFn = vi.fn(() => child)
     const runner = createClaudeCliRunner(spawnFn)
-
-    const { claudeSessionId } = runner.runTurn({ content: 'hello', projectPath: '/app/workspace/proj' })
-    expect(claudeSessionId).toMatch(/^[0-9a-f-]{36}$/)
-
+    runner.runTurn({ content: 'hello', projectPath: '/app/workspace/proj' })
     const [, args] = spawnFn.mock.calls[0]
-    expect(args[args.indexOf('--session-id') + 1]).toBe(claudeSessionId)
+    expect(args).not.toContain('--session-id')
+    expect(args).not.toContain('--resume')
+  })
+
+  it('passes --mcp-config/--strict-mcp-config/--allowedTools from the injected bridge when tools are given', () => {
+    const child = fakeChild()
+    const spawnFn = vi.fn(() => child)
+    const fakeCreateMcpBridge = vi.fn(() => ({ mcpConfigPath: '/tmp/fake/mcp-config.json', allowedToolNames: ['mcp__client-tools__get_weather'], cleanup: vi.fn() }))
+    const runner = createClaudeCliRunner(spawnFn, { createMcpBridge: fakeCreateMcpBridge })
+    const tools = [{ type: 'function', function: { name: 'get_weather', parameters: {} } }]
+    runner.runTurn({ content: 'hi', projectPath: '/app/workspace/proj', tools })
+    const [, args] = spawnFn.mock.calls[0]
+    expect(args).toContain('--strict-mcp-config')
+    expect(args[args.indexOf('--mcp-config') + 1]).toBe('/tmp/fake/mcp-config.json')
+    expect(args[args.indexOf('--allowedTools') + 1]).toBe('mcp__client-tools__get_weather')
+  })
+
+  it('does not pass mcp args when no tools are given', () => {
+    const child = fakeChild()
+    const spawnFn = vi.fn(() => child)
+    const runner = createClaudeCliRunner(spawnFn)
+    runner.runTurn({ content: 'hi', projectPath: '/app/workspace/proj' })
+    const [, args] = spawnFn.mock.calls[0]
+    expect(args).not.toContain('--mcp-config')
+    expect(args).not.toContain('--strict-mcp-config')
+    expect(args).not.toContain('--allowedTools')
+  })
+
+  it('builds the mcp config via the injected createMcpBridge and calls its cleanup once the process closes', async () => {
+    const child = fakeChild()
+    const spawnFn = vi.fn(() => child)
+    const cleanup = vi.fn()
+    const fakeCreateMcpBridge = vi.fn(() => ({ mcpConfigPath: '/tmp/fake/mcp-config.json', allowedToolNames: ['mcp__client-tools__get_weather'], cleanup }))
+    const runner = createClaudeCliRunner(spawnFn, { createMcpBridge: fakeCreateMcpBridge })
+    const tools = [{ type: 'function', function: { name: 'get_weather', parameters: {} } }]
+
+    const { promise } = runner.runTurn({ content: 'hi', projectPath: '/app/workspace/proj', tools })
+    promise.catch(() => {})
+
+    expect(fakeCreateMcpBridge).toHaveBeenCalledWith(tools)
+    const [, args] = spawnFn.mock.calls[0]
+    expect(args[args.indexOf('--mcp-config') + 1]).toBe('/tmp/fake/mcp-config.json')
+    expect(cleanup).not.toHaveBeenCalled()
+
+    child.emit('close', 0)
+    expect(cleanup).toHaveBeenCalledTimes(1)
   })
 
   it('writes the content to stdin and closes it', () => {
@@ -102,20 +140,6 @@ describe('createClaudeCliRunner', () => {
 
     expect(child.stdin.write).toHaveBeenCalledWith('hello there')
     expect(child.stdin.end).toHaveBeenCalled()
-  })
-
-  it('resumes an existing claude session with --resume instead of --session-id', () => {
-    const child = fakeChild()
-    const spawnFn = vi.fn(() => child)
-    const runner = createClaudeCliRunner(spawnFn)
-
-    runner.runTurn({ content: 'again', projectPath: '/app/workspace/proj', claudeSessionId: 'existing-uuid' })
-
-    const [, args] = spawnFn.mock.calls[0]
-    expect(args).not.toContain('--session-id')
-    const resumeIndex = args.indexOf('--resume')
-    expect(resumeIndex).toBeGreaterThan(-1)
-    expect(args[resumeIndex + 1]).toBe('existing-uuid')
   })
 
   it('passes --model when a model is given', () => {
