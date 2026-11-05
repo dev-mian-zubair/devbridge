@@ -1,5 +1,7 @@
 import { spawn } from 'node:child_process'
-import { createMcpBridge as realCreateMcpBridge } from './mcpBridge.js'
+import { createMcpBridge as realCreateMcpBridge, MCP_SERVER_NAME } from './mcpBridge.js'
+
+const MCP_PREFIX = `mcp__${MCP_SERVER_NAME}__`
 
 // Claude Code's `-p/--print` mode is its officially supported non-interactive
 // interface: `--output-format stream-json --include-partial-messages` emits
@@ -70,7 +72,7 @@ function signalProcessGroup(child, signal) {
 
 export function createClaudeCliRunner(spawnFn = spawn, { killGraceMs = 5000, createMcpBridge = realCreateMcpBridge } = {}) {
   return {
-    runTurn({ content, projectPath, model, systemPrompt, effort, jsonSchema, tools, onDelta }) {
+    runTurn({ content, projectPath, model, systemPrompt, effort, jsonSchema, tools, onDelta, onToolCallDelta }) {
       let mcpConfigPath = null
       let allowedToolNames = []
       let cleanupMcpBridge = null
@@ -106,6 +108,16 @@ export function createClaudeCliRunner(spawnFn = spawn, { killGraceMs = 5000, cre
         cleanupMcpBridge?.()
       })
 
+      function killNow() {
+        if (exited) return
+        signalProcessGroup(child, 'SIGTERM')
+        const killTimer = setTimeout(() => {
+          if (!exited) signalProcessGroup(child, 'SIGKILL')
+        }, killGraceMs)
+        killTimer.unref?.()
+        child.once('close', () => clearTimeout(killTimer))
+      }
+
       const promise = new Promise((resolve, reject) => {
         function settleResolve(value) {
           if (settled) return
@@ -118,6 +130,11 @@ export function createClaudeCliRunner(spawnFn = spawn, { killGraceMs = 5000, cre
           reject(err)
         }
 
+        // Blocks accumulated for the message currently in flight — reset at
+        // every message_start, so a client (MCP) tool call only reported in
+        // an earlier message of this turn never leaks into a later stop.
+        let currentBlocks = new Map()
+
         function handleLine(line) {
           let event
           try {
@@ -128,6 +145,34 @@ export function createClaudeCliRunner(spawnFn = spawn, { killGraceMs = 5000, cre
 
           if (event.type === 'stream_event' && event.event?.type === 'message_start') {
             capturedModel = event.event.message?.model ?? capturedModel
+            currentBlocks = new Map()
+            return
+          }
+
+          if (
+            event.type === 'stream_event' &&
+            event.event?.type === 'content_block_start' &&
+            event.event.content_block?.type === 'tool_use' &&
+            event.event.content_block.name?.startsWith(MCP_PREFIX)
+          ) {
+            const { index } = event.event
+            const { id, name } = event.event.content_block
+            const bareName = name.slice(MCP_PREFIX.length)
+            currentBlocks.set(index, { id, name: bareName, argsBuf: '' })
+            onToolCallDelta?.({ index, id, name: bareName, argumentsFragment: '' })
+            return
+          }
+
+          if (
+            event.type === 'stream_event' &&
+            event.event?.type === 'content_block_delta' &&
+            event.event.delta?.type === 'input_json_delta' &&
+            currentBlocks.has(event.event.index)
+          ) {
+            const { index } = event.event
+            const fragment = event.event.delta.partial_json
+            currentBlocks.get(index).argsBuf += fragment
+            onToolCallDelta?.({ index, argumentsFragment: fragment })
             return
           }
 
@@ -137,6 +182,24 @@ export function createClaudeCliRunner(spawnFn = spawn, { killGraceMs = 5000, cre
             event.event.delta?.type === 'text_delta'
           ) {
             onDelta?.(event.event.delta.text)
+            return
+          }
+
+          if (event.type === 'stream_event' && event.event?.type === 'message_delta' && event.event.delta?.stop_reason === 'tool_use') {
+            if (currentBlocks.size === 0) return
+            const toolCalls = [...currentBlocks.entries()].map(([index, b]) => ({ index, id: b.id, name: b.name, arguments: b.argsBuf }))
+            settleResolve({
+              text: '',
+              usage: event.event.usage ?? null,
+              totalCostUsd: null,
+              claudeSessionId: null,
+              isError: false,
+              stopReason: 'tool_use',
+              subtype: null,
+              model: capturedModel,
+              toolCalls,
+            })
+            killNow()
             return
           }
 
@@ -201,15 +264,7 @@ export function createClaudeCliRunner(spawnFn = spawn, { killGraceMs = 5000, cre
 
       return {
         promise,
-        kill: () => {
-          if (exited) return
-          signalProcessGroup(child, 'SIGTERM')
-          const killTimer = setTimeout(() => {
-            if (!exited) signalProcessGroup(child, 'SIGKILL')
-          }, killGraceMs)
-          killTimer.unref?.()
-          child.once('close', () => clearTimeout(killTimer))
-        },
+        kill: killNow,
       }
     },
   }

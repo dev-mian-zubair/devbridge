@@ -48,6 +48,16 @@ function messageStartLine(model) {
   )
 }
 
+function toolUseStartLine(index, id, name) {
+  return JSON.stringify({ type: 'stream_event', event: { type: 'content_block_start', index, content_block: { type: 'tool_use', id, name, input: {} } } }) + '\n'
+}
+function inputJsonDeltaLine(index, partialJson) {
+  return JSON.stringify({ type: 'stream_event', event: { type: 'content_block_delta', index, delta: { type: 'input_json_delta', partial_json: partialJson } } }) + '\n'
+}
+function toolUseMessageDeltaLine(usage) {
+  return JSON.stringify({ type: 'stream_event', event: { type: 'message_delta', delta: { stop_reason: 'tool_use' }, usage } }) + '\n'
+}
+
 describe('createClaudeCliRunner', () => {
   afterEach(() => {
     vi.restoreAllMocks()
@@ -422,5 +432,97 @@ describe('createClaudeCliRunner', () => {
 
     expect(killSpy).toHaveBeenCalledWith(-4242, 'SIGTERM')
     expect(killSpy).not.toHaveBeenCalledWith(-4242, 'SIGKILL')
+  })
+
+  it('resolves with toolCalls accumulated from an MCP-prefixed tool_use block, and kills the process', async () => {
+    const child = fakeChild()
+    const spawnFn = vi.fn(() => child)
+    const runner = createClaudeCliRunner(spawnFn)
+    const { promise } = runner.runTurn({ content: 'hi', projectPath: '/app/workspace/proj' })
+
+    child.stdout.emit('data', messageStartLine('claude-sonnet-5'))
+    child.stdout.emit('data', toolUseStartLine(0, 'toolu_1', 'mcp__client-tools__get_weather'))
+    child.stdout.emit('data', inputJsonDeltaLine(0, ''))
+    child.stdout.emit('data', inputJsonDeltaLine(0, '{"location":"Paris"}'))
+    const usage = { input_tokens: 2, output_tokens: 10, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
+    child.stdout.emit('data', toolUseMessageDeltaLine(usage))
+    const outcome = await promise
+
+    expect(outcome.toolCalls).toEqual([{ index: 0, id: 'toolu_1', name: 'get_weather', arguments: '{"location":"Paris"}' }])
+    expect(outcome.stopReason).toBe('tool_use')
+    expect(outcome.usage).toEqual(usage)
+    expect(outcome.isError).toBe(false)
+  })
+
+  it('calls onToolCallDelta for each fragment, keyed by index, with id/name only on the first call', async () => {
+    const child = fakeChild()
+    const spawnFn = vi.fn(() => child)
+    const runner = createClaudeCliRunner(spawnFn)
+    const onToolCallDelta = vi.fn()
+    const { promise } = runner.runTurn({ content: 'hi', projectPath: '/app/workspace/proj', onToolCallDelta })
+
+    child.stdout.emit('data', toolUseStartLine(0, 'toolu_1', 'mcp__client-tools__get_weather'))
+    child.stdout.emit('data', inputJsonDeltaLine(0, '{"location":"Paris"}'))
+    child.stdout.emit('data', toolUseMessageDeltaLine({}))
+    await promise
+
+    expect(onToolCallDelta.mock.calls).toEqual([
+      [{ index: 0, id: 'toolu_1', name: 'get_weather', argumentsFragment: '' }],
+      [{ index: 0, argumentsFragment: '{"location":"Paris"}' }],
+    ])
+  })
+
+  it('does not intercept a CLI-native tool_use block (no mcp__ prefix)', async () => {
+    const child = fakeChild()
+    const spawnFn = vi.fn(() => child)
+    const runner = createClaudeCliRunner(spawnFn)
+    const onToolCallDelta = vi.fn()
+    const { promise } = runner.runTurn({ content: 'hi', projectPath: '/app/workspace/proj', onToolCallDelta })
+
+    child.stdout.emit('data', toolUseStartLine(0, 'toolu_native', 'Bash'))
+    child.stdout.emit('data', inputJsonDeltaLine(0, '{"command":"ls"}'))
+    // A native call does not stop the turn for us; the CLI's own loop
+    // continues and eventually produces a normal result.
+    child.stdout.emit('data', resultLine())
+    const outcome = await promise
+
+    expect(onToolCallDelta).not.toHaveBeenCalled()
+    expect(outcome.toolCalls).toBeFalsy()
+  })
+
+  it('resets accumulated blocks on message_start, so only the last message before the stop is reported (Review Focus)', async () => {
+    const child = fakeChild()
+    const spawnFn = vi.fn(() => child)
+    const runner = createClaudeCliRunner(spawnFn)
+    const { promise } = runner.runTurn({ content: 'hi', projectPath: '/app/workspace/proj' })
+
+    // First message: a native call only — must not leak into the final toolCalls.
+    child.stdout.emit('data', messageStartLine('claude-sonnet-5'))
+    child.stdout.emit('data', toolUseStartLine(0, 'toolu_native', 'Bash'))
+    child.stdout.emit('data', inputJsonDeltaLine(0, '{}'))
+    // Second message: the client tool call that actually stops the turn.
+    child.stdout.emit('data', messageStartLine('claude-sonnet-5'))
+    child.stdout.emit('data', toolUseStartLine(0, 'toolu_mcp', 'mcp__client-tools__get_weather'))
+    child.stdout.emit('data', inputJsonDeltaLine(0, '{"location":"Paris"}'))
+    child.stdout.emit('data', toolUseMessageDeltaLine({}))
+    const outcome = await promise
+
+    expect(outcome.toolCalls).toEqual([{ index: 0, id: 'toolu_mcp', name: 'get_weather', arguments: '{"location":"Paris"}' }])
+  })
+
+  it('a message_delta tool_use stop with zero accumulated mcp blocks does not resolve the turn', async () => {
+    const child = fakeChild()
+    const spawnFn = vi.fn(() => child)
+    const runner = createClaudeCliRunner(spawnFn)
+    const { promise } = runner.runTurn({ content: 'hi', projectPath: '/app/workspace/proj' })
+
+    child.stdout.emit('data', toolUseStartLine(0, 'toolu_native', 'Bash'))
+    child.stdout.emit('data', inputJsonDeltaLine(0, '{}'))
+    child.stdout.emit('data', toolUseMessageDeltaLine({})) // native-only stop — must not settle the promise
+    child.stdout.emit('data', resultLine({ result: 'done after native tool' }))
+    const outcome = await promise
+
+    expect(outcome.text).toBe('done after native tool')
+    expect(outcome.toolCalls).toBeFalsy()
   })
 })
