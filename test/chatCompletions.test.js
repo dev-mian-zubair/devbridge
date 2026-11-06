@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from 'vitest'
 import http from 'node:http'
+import os from 'node:os'
 import express from 'express'
 import request from 'supertest'
 import { createChatCompletionsRouter } from '../src/routes/chatCompletions.js'
@@ -210,10 +211,19 @@ describe('POST /v1/chat/completions', () => {
       expect(res.status).toBe(400)
       expect(res.body.error.type).toBe('invalid_request_error')
     })
-  })
 
-  describe('X-Agent-Mode header', () => {
-    it('defaults agentMode to undefined (plain chat) when the header is absent', async () => {
+    it('defaults projectPath to a fixed temp directory when sessionId is given but projectPath is omitted entirely', async () => {
+      const runner = fakeRunner()
+      const { app } = appWith(runner)
+      const reqPromise = request(app).post('/v1/chat/completions').send({
+        sessionId: 's1', messages: [{ role: 'user', content: 'hi' }],
+      })
+      reqPromise.catch(() => {})
+      await waitForPending(runner)
+      expect(runner.pending[0].opts.projectPath).toBe(os.tmpdir())
+    })
+
+    it('does not override an explicitly given projectPath with the default', async () => {
       const runner = fakeRunner()
       const { app } = appWith(runner)
       const reqPromise = request(app).post('/v1/chat/completions').send({
@@ -221,10 +231,12 @@ describe('POST /v1/chat/completions', () => {
       })
       reqPromise.catch(() => {})
       await waitForPending(runner)
-      expect(runner.pending[0].opts.agentMode).toBeUndefined()
+      expect(runner.pending[0].opts.projectPath).toBe('/app/workspace/proj')
     })
+  })
 
-    it('passes agentMode "coding" when X-Agent-Mode: coding is set', async () => {
+  describe('coding mode is fully locked out', () => {
+    it('never passes agentMode to the runner, even when X-Agent-Mode: coding is sent (guarantee: no client can ever reach coding mode)', async () => {
       const runner = fakeRunner()
       const { app } = appWith(runner)
       const reqPromise = request(app).post('/v1/chat/completions')
@@ -232,10 +244,10 @@ describe('POST /v1/chat/completions', () => {
         .send({ sessionId: 's1', projectPath: '/app/workspace/proj', messages: [{ role: 'user', content: 'hi' }] })
       reqPromise.catch(() => {})
       await waitForPending(runner)
-      expect(runner.pending[0].opts.agentMode).toBe('coding')
+      expect(runner.pending[0].opts.agentMode).toBeUndefined()
     })
 
-    it('treats any other X-Agent-Mode value as the default (not "coding")', async () => {
+    it('ignores any other X-Agent-Mode value too', async () => {
       const runner = fakeRunner()
       const { app } = appWith(runner)
       const reqPromise = request(app).post('/v1/chat/completions')
@@ -243,7 +255,7 @@ describe('POST /v1/chat/completions', () => {
         .send({ sessionId: 's1', projectPath: '/app/workspace/proj', messages: [{ role: 'user', content: 'hi' }] })
       reqPromise.catch(() => {})
       await waitForPending(runner)
-      expect(runner.pending[0].opts.agentMode).not.toBe('coding')
+      expect(runner.pending[0].opts.agentMode).toBeUndefined()
     })
   })
 

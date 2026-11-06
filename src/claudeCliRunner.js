@@ -11,8 +11,11 @@ const MCP_PREFIX = `mcp__${MCP_SERVER_NAME}__`
 // plain chat/reasoning call (e.g. driving a non-coding LangGraph agent)
 // can get coding-flavored answers or have the model actually try to read
 // files / run shell commands that have nothing to do with the request.
-// This is the DEFAULT; a caller that genuinely wants the real agent
-// (tools, persona, and all) asks for it via agentMode: 'coding'.
+// There used to be an opt-out (agentMode: "coding") that restored the real
+// agent, tools and persona intact. It's been removed entirely, on purpose:
+// this guarantees no caller — not a client header, not a future direct
+// call into this module — can ever reach real file/shell access through
+// this server, rather than relying on nobody asking for it.
 const DEFAULT_MODE_DISALLOWED_TOOLS = [
   'Task', 'Bash', 'CronCreate', 'CronDelete', 'CronList', 'DesignSync', 'Edit',
   'EnterWorktree', 'ExitWorktree', 'ListAgents', 'Monitor', 'NotebookEdit',
@@ -51,7 +54,7 @@ function spawnEnv() {
   return rest
 }
 
-function buildArgs({ model, systemPrompt, effort, jsonSchema, mcpConfigPath, allowedToolNames, agentMode, requireToolUse, forcedToolName }) {
+function buildArgs({ model, systemPrompt, effort, jsonSchema, mcpConfigPath, allowedToolNames, requireToolUse, forcedToolName }) {
   const args = [
     '-p',
     '--output-format',
@@ -63,9 +66,7 @@ function buildArgs({ model, systemPrompt, effort, jsonSchema, mcpConfigPath, all
   ]
   if (model) args.push('--model', model)
 
-  const isChatMode = agentMode !== 'coding'
-  const promptParts = []
-  if (isChatMode) promptParts.push(CORRECTIVE_SYSTEM_PROMPT)
+  const promptParts = [CORRECTIVE_SYSTEM_PROMPT]
   if (systemPrompt) promptParts.push(systemPrompt)
   if (requireToolUse) {
     // Best-effort only — there's no CLI flag that forces a tool call the
@@ -91,21 +92,13 @@ function buildArgs({ model, systemPrompt, effort, jsonSchema, mcpConfigPath, all
     args.push('--mcp-config', mcpConfigPath, '--strict-mcp-config', '--allowedTools', ...effectiveAllowedToolNames)
   }
 
-  // Chat mode's disallow list already includes Task, subsuming the
-  // tools-bearing-turn mitigation below — never push --disallowedTools
-  // twice for the same invocation.
-  if (isChatMode) {
-    args.push('--disallowedTools', ...DEFAULT_MODE_DISALLOWED_TOOLS)
-  } else if (mcpConfigPath) {
-    // Defensive: whether a native subagent's (Task tool) own tool calls are
-    // forwarded on this stream, and if so whether they're distinguishable
-    // from the top-level turn's, is unverified. Disallowing Task outright
-    // on any tools-bearing turn closes that off regardless of the answer —
-    // the interception's anti-goal (the stub handler must never actually
-    // run, and a turn must never end on the wrong tool call) is worth more
-    // here than a subagent's availability during tool-calling specifically.
-    args.push('--disallowedTools', 'Task')
-  }
+  // The full default disallow list (always applied — see the comment on
+  // DEFAULT_MODE_DISALLOWED_TOOLS) already includes Task, which also
+  // covers the narrower tools-bearing-turn mitigation this project used to
+  // apply separately (a native subagent's own tool calls being forwarded
+  // on this stream, indistinguishably from the top-level turn's, was
+  // unverified) — one disallow list, never pushed twice.
+  args.push('--disallowedTools', ...DEFAULT_MODE_DISALLOWED_TOOLS)
   return args
 }
 
@@ -146,7 +139,7 @@ function signalProcessGroup(child, signal) {
 
 export function createClaudeCliRunner(spawnFn = spawn, { killGraceMs = 5000, createMcpBridge = realCreateMcpBridge } = {}) {
   return {
-    runTurn({ content, projectPath, model, systemPrompt, effort, jsonSchema, tools, agentMode, stopSequences = [], requireToolUse, forcedToolName, onDelta, onToolCallDelta }) {
+    runTurn({ content, projectPath, model, systemPrompt, effort, jsonSchema, tools, stopSequences = [], requireToolUse, forcedToolName, onDelta, onToolCallDelta }) {
       let mcpConfigPath = null
       let allowedToolNames = []
       let cleanupMcpBridge = null
@@ -157,7 +150,7 @@ export function createClaudeCliRunner(spawnFn = spawn, { killGraceMs = 5000, cre
         cleanupMcpBridge = bridge.cleanup
       }
 
-      const args = buildArgs({ model, systemPrompt, effort, jsonSchema, mcpConfigPath, allowedToolNames, agentMode, requireToolUse, forcedToolName })
+      const args = buildArgs({ model, systemPrompt, effort, jsonSchema, mcpConfigPath, allowedToolNames, requireToolUse, forcedToolName })
 
       let child
       try {

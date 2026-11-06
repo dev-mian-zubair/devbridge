@@ -7,28 +7,38 @@ dashboard — all in a single Docker container.
 
 ## Why this exists
 
-The Claude Code CLI already gives you a capable coding agent from the
-terminal, backed by a Claude Pro/Team **subscription** rather than a
-usage-priced API key. DevBridge's job is to make that same agent reachable
-the way any other LLM backend is reachable: a standard HTTP endpoint that
-takes OpenAI-style chat-completions requests, so local tools, scripts, and
-OpenAI-SDK-based applications under active development can point at it like
-they would point at `api.openai.com`, without paying per-token API rates on
-top of a subscription you already have.
+The Claude Code CLI gives you Claude itself, backed by a Claude Pro/Team
+**subscription** rather than a usage-priced API key. DevBridge's job is to
+make the *model* reachable the way any other LLM backend is reachable — a
+standard HTTP endpoint that takes OpenAI-style chat-completions requests,
+so local tools, scripts, and OpenAI-SDK-based applications (LangChain,
+LangGraph, the Vercel AI SDK, ...) can point at it like they would point at
+`api.openai.com`, without paying per-token API rates on top of a
+subscription you already have — while deliberately *not* exposing the
+CLI's own agentic capabilities (file access, shell execution) to do it.
+Every request is sandboxed away from those by default, with no way to opt
+back into them (see "Agent sandboxing" under
+[`POST /v1/chat/completions`](#post-v1chatcompletions) below) — this is a
+plain chat/reasoning model behind an OpenAI-shaped API, not a
+remote-controllable coding agent.
 
 ### Core philosophy
 
 - **Local-only, single-user.** This is a development convenience, not a
   multi-tenant service. It binds to loopback by default and assumes one
-  person, one machine, one CLI session at a time per `sessionId`.
+  person, one machine, one turn at a time per `sessionId`.
 - **No credential handling of its own.** DevBridge never asks for, stores,
   or transmits an Anthropic API key. Authentication is the CLI's own
   `/login` device-code flow, running exactly as it would in a real
   terminal; DevBridge only gives you a browser window to drive it from.
-- **The CLI is the source of truth.** DevBridge translates wire formats and
-  manages process lifecycles; it never second-guesses what the CLI itself
-  decided (what tools ran, what a turn's stop reason was, what it actually
-  cost).
+- **The CLI is the source of truth** for everything it's still allowed to
+  decide under the sandbox below (what a turn's stop reason was, what it
+  actually cost) — DevBridge translates wire formats and manages process
+  lifecycles, it doesn't second-guess those.
+- **No agent capability, no exceptions.** File access and shell execution
+  are disallowed on every request, unconditionally — there is no header,
+  field, or configuration that restores them. This is treated as a
+  correctness property of the server, not a client-chosen default.
 
 ## Architecture
 
@@ -86,12 +96,30 @@ src/
                         mounts both routers, sets up the WS upgrade handler.
   config.js             Reads PORT/HOST/CLAUDE_CONFIG_DIR/timeout env vars.
   claudeCliRunner.js     Non-PTY path: spawns `claude -p --output-format
-                        stream-json`, parses NDJSON events, exposes
-                        runTurn({content, projectPath, ...}) -> {promise, kill}.
+                        stream-json`, parses NDJSON events, intercepts
+                        client tool-call proposals and stop-sequence
+                        matches, always sandboxes the CLI's native
+                        persona/tools (no opt-out), exposes
+                        runTurn({content, projectPath, tools,
+                        stopSequences, ...}) -> {promise, kill}.
+  historySerializer.js   Renders the full OpenAI messages[] array (including
+                        prior tool_calls/tool results) into the plain-text
+                        prompt sent to the CLI's stdin — this is what makes
+                        every turn stateless, full-history replay instead
+                        of CLI-side session continuity.
+  mcpBridge.js            Builds a per-request MCP server config + stub
+                        tool-list file for a request's client-declared
+                        `tools`, and its cleanup; exports MCP_SERVER_NAME.
+  mcpStubServer.mjs       The actual stdio MCP server process mcpBridge.js
+                        points the CLI at. Reports the client's real tool
+                        schemas; its call handler is never meant to run —
+                        claudeCliRunner.js kills the CLI process before it
+                        would ever dispatch to it.
   turnSessions.js        In-memory sessionId -> {projectPath, claudeSessionId,
                         status, lastRequest, lastResult, lastError} store for
                         the chat-completions path; publishes session:update
-                        on every mutation.
+                        on every mutation. claudeSessionId is observability
+                        only now — it's never fed back into a later turn.
   turnEvents.js           Tiny pub/sub bus decoupling publishers
                         (chatCompletions, turnSessions) from the dashboard's
                         WS subscribers.
@@ -100,9 +128,10 @@ src/
                         collected on completion/disconnect/timeout.
   sessionErrors.js       Shared SessionConflictError / InvalidProjectPathError.
   routes/
-    chatCompletions.js   POST /v1/chat/completions — validation, streaming,
-                        usage mapping, error-type mapping, turnSessions/
-                        turnEvents updates for the dashboard.
+    chatCompletions.js   POST /v1/chat/completions — validation (including
+                        tools/tool_choice/stop), streaming, usage mapping,
+                        error-type mapping, turnSessions/turnEvents updates
+                        for the dashboard.
     models.js            GET /v1/models.
   ws/
     sessionStream.js      WS /api/session/stream handler: session snapshot +
@@ -113,7 +142,10 @@ public/
   style.css               tree with live status, sign-in flow. Plain text
                         throughout — no terminal emulator, since neither the
                         login flow nor the observability view renders one.
-test/                     vitest + supertest; one file per src module above.
+test/                     vitest + supertest; one test file per src/ module
+                        (plus one for public/terminalBuffer.js, the
+                        dashboard's own minimal ANSI-handling virtual
+                        terminal).
 Dockerfile                node:20-bookworm-slim + globally installed CLI.
 ```
 
@@ -144,9 +176,12 @@ environment variables — see `.env.example`:
 npm test
 ```
 
-130+ tests across one file per `src/` module (`vitest` + `supertest`), no
-network access and no real CLI invocation — the CLI process is always
-injected (`spawnFn`) and faked.
+230+ tests across 14 files (`vitest` + `supertest`), no network access and
+no real CLI invocation in the suite itself — the CLI process is always
+injected (`spawnFn`) and faked. Every chat-completions behavior described
+below (tool calling, `stop`, `tool_choice`, agent sandboxing, full-history
+replay) was also exercised live against the real CLI during development;
+this test suite is the one that runs in CI.
 
 ## Building and running the Docker image
 
@@ -156,16 +191,17 @@ docker build -t devbridge .
 docker run -d --name devbridge \
   -p 127.0.0.1:3000:3000 \
   -v devbridge-claude-config:/data/.claude \
-  -v /host/path/to/project:/app/workspace/project \
   devbridge
 ```
 
 - `devbridge-claude-config` is a named Docker volume that persists auth
   tokens, device configuration, and session history across container
-  restarts (`CLAUDE_CONFIG_DIR=/data/.claude` inside the container).
-- Mount each project you want to work on under `/app/workspace/...` and
-  pass that container path as `projectPath` (or `X-Project-Path`) in API
-  requests.
+  restarts (`CLAUDE_CONFIG_DIR=/data/.claude` inside the container). This
+  is the only volume the chat-completions path needs — there's no reason
+  to mount a project directory into the container, since every request is
+  sandboxed away from the filesystem by default with no opt-out (see
+  "Agent sandboxing" under [`POST /v1/chat/completions`](#post-v1chatcompletions)
+  below); `projectPath` defaults to a fixed temp directory on its own.
 - The image binds the server to `0.0.0.0` *inside* the container — the
   `-p 127.0.0.1:3000:3000` above is what keeps it off the network, same as
   local dev's own `127.0.0.1` default. Docker's port-forward lands on the
@@ -210,12 +246,14 @@ across container restarts — there's no separate credential step for the
 curl http://127.0.0.1:3000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -H 'X-Session-Id: s1' \
-  -H 'X-Project-Path: /app/workspace/project' \
   -d '{
     "model": "opus",
     "messages": [{ "role": "user", "content": "say OK" }]
   }'
 ```
+
+(`X-Session-Id` is the only thing you have to set — see "Session
+identity" just below.)
 
 ```json
 {
@@ -242,41 +280,59 @@ curl http://127.0.0.1:3000/v1/chat/completions \
 
 **Session identity**
 
-- `sessionId`/`projectPath` are required, as the `X-Session-Id` /
-  `X-Project-Path` headers (preferred — this keeps the JSON body pure
-  OpenAI wire format, so an off-the-shelf OpenAI SDK with default headers
-  configured needs no payload changes at all) or as `sessionId`/
-  `projectPath` body fields (still supported for backward compatibility; a
-  header wins if both are given).
+- `sessionId` is required, as the `X-Session-Id` header (preferred — this
+  keeps the JSON body pure OpenAI wire format, so an off-the-shelf OpenAI
+  SDK with a default header configured needs no payload changes at all)
+  or as a `sessionId` body field (still supported for backward
+  compatibility; a header wins if both are given). This is the only field
+  you have to set — see "Agent sandboxing" just below for why
+  `projectPath` isn't required too.
+- `projectPath` (`X-Project-Path` header or body field, same precedence
+  rule) is optional. If given, it must be an absolute path that exists and
+  is a directory inside the container (400 `invalid_project_path`
+  otherwise, checked *before* anything is spawned). If omitted entirely —
+  from both the header and the body — it defaults to a fixed system temp
+  directory (`os.tmpdir()`), since nothing in the sandboxed default mode
+  touches the filesystem anyway.
 - The same `sessionId` must always be paired with the same `projectPath`
   (409 `session_conflict` otherwise — this catches accidentally reusing an
-  id across two different projects).
-- `projectPath` must be an absolute path that exists and is a directory
-  inside the container (400 `invalid_project_path` otherwise, checked
-  *before* anything is spawned).
+  id across two different projects). This still applies to the defaulted
+  value: if you ever send an explicit `projectPath` for a `sessionId` that
+  first ran without one, that's a conflict against the default it already
+  got.
 
-**Agent mode — plain chat by default, not Claude Code**
+**Agent sandboxing — not Claude Code**
 
-- By default, every request gets a corrected system prompt (telling the
-  model it's a plain chat/reasoning model via an OpenAI-compatible API,
-  not Claude Code working in a project directory) and every one of the
-  CLI's own built-in tools is disallowed (`--disallowedTools` with the
-  full list: `Bash`, `Edit`, `Write`, `Read`, `NotebookEdit`, `Task`,
-  `Skill`, `ToolSearch`, `WebFetch`, `WebSearch`, and the rest of the
-  orchestration/scheduling tools). This exists because DevBridge's own
-  CLI still defaults to its real persona and full tool surface underneath
-  — without correcting for that, a plain chat call (e.g. driving a
-  non-coding LangGraph agent) can get coding-flavored answers, or have
-  the model actually try to read files or run shell commands that have
-  nothing to do with the request.
-- Send `X-Agent-Mode: coding` to opt back into the real agent: the
-  corrected system prompt and the disallow list are both skipped, and you
-  get today's full Claude-Code-in-a-project behavior, tools included. Any
-  other header value (or no header) stays on the default.
+- Every request, unconditionally, gets a corrected system prompt (telling
+  the model it's a plain chat/reasoning model via an OpenAI-compatible
+  API, not Claude Code working in a project directory) and the CLI's
+  entire built-in tool set disallowed via `--disallowedTools` — confirmed
+  live against a fresh, plugin-free config directory, this exact list:
+  `Task`, `Bash`, `CronCreate`, `CronDelete`, `CronList`, `DesignSync`,
+  `Edit`, `EnterWorktree`, `ExitWorktree`, `ListAgents`, `Monitor`,
+  `NotebookEdit`, `PushNotification`, `Read`, `RemoteTrigger`,
+  `ReportFindings`, `ScheduleWakeup`, `SendMessage`, `Skill`, `TaskStop`,
+  `ToolSearch`, `WebFetch`, `WebSearch`, `Workflow`, `Write`. This exists
+  because the underlying CLI still defaults to its real persona and full
+  tool surface — without correcting for that, a plain chat call (e.g.
+  driving a non-coding LangGraph agent) can get coding-flavored answers,
+  or have the model actually try to read files or run shell commands that
+  have nothing to do with the request.
+- **There is no opt-out.** No header, request field, or configuration
+  restores the CLI's native tools or persona — this used to be
+  configurable per request (an `X-Agent-Mode: coding` header), and that
+  escape hatch was removed on purpose: any value sent for that header
+  today is silently ignored, so a deployment behind a gateway other
+  clients can reach has no way for any of them — intentionally or by
+  accident — to get real file/shell access through this server.
 - Client-declared `tools` (OpenAI-style function-calling, below) work
-  independently of this and in either mode — a non-coding client can use
-  its own `tools` for real function-calling while native coding tools
-  stay suppressed.
+  independently of this — real function-calling always works, while the
+  CLI's own native tools stay suppressed.
+- Because nothing touches the filesystem, `projectPath` is optional: if
+  omitted from both the header and the body, it defaults to a fixed
+  system temp directory (Node's `os.tmpdir()`) — see "Session identity"
+  just above. Only set it explicitly if you have some other reason to
+  care what directory the process runs in.
 
 **Request fields**
 
@@ -393,6 +449,14 @@ turn runs and completes normally — it was never represented in the OpenAI
 response shape anyway — and only a client-declared call ever stops the
 turn.
 
+Each `tools[].function.name` is restricted to OpenAI's own function-name
+charset (`^[A-Za-z0-9_-]{1,64}$`, 400 otherwise) and must be unique within
+the request (400 on a duplicate). This isn't just strictness for its own
+sake: a name becomes an `--allowedTools` argv entry the CLI itself parses
+for scoped-permission syntax (e.g. `"Bash(git *)"`, comma/space-separated
+lists), so an unrestricted name could otherwise smuggle in an extra
+permission rule — this charset closes that off entirely.
+
 **`tool_choice: "required"`/forced-name tool — best-effort, not a
 guarantee.** There is no CLI flag that actually forces a tool call; the
 only lever is a system-prompt instruction appended to the turn ("you must
@@ -429,8 +493,18 @@ available before truncating.
 
 - Set `"stream": true` for Server-Sent Events of `chat.completion.chunk`
   objects (OpenAI wire format): a role-chunk first, then one delta chunk
-  per token, a final chunk carrying `finish_reason`, all terminated by
-  `data: [DONE]`.
+  per token (`delta: {content}`) or tool-call argument fragment, a final
+  chunk carrying `finish_reason`, all terminated by `data: [DONE]`.
+- When `tools` are given, tool-call arguments stream incrementally too —
+  real argument deltas (assembled from the same `input_json_delta` events
+  Claude's own native tool-use streaming uses), not one batched chunk at
+  the end. The first chunk for a given call carries `delta.tool_calls:
+  [{index, id, type: "function", function: {name, arguments: ""}}]`;
+  later chunks for the same `index` carry only
+  `delta.tool_calls: [{index, function: {arguments: "<fragment>"}}]` —
+  `index` is 0-based and gapless among tool calls only, never the raw
+  position among any preceding text in the same message. The final chunk
+  carries `finish_reason: "tool_calls"`.
 - Add `"stream_options": {"include_usage": true}` for a trailing
   usage-only chunk (`choices: []`, `usage: {...}`) before `[DONE]`,
   matching the real OpenAI API's own convention.
@@ -450,7 +524,9 @@ available before truncating.
   escalating to SIGKILL after a grace period if it doesn't exit).
 - A second request for a `sessionId` that already has a turn in flight
   gets `503 {"error": {"type": "session_busy"}}` with `Retry-After: 1` —
-  the CLI session itself can't run two turns concurrently.
+  a given `sessionId`'s turns are serialized, one at a time; different
+  `sessionId`s run fully concurrently (see
+  [Known limitations](#known-limitations) for what bounds that).
 - Error responses use OpenAI's generic type names where one exists
   (`invalid_request_error`, `server_error`) and proxy-specific ones where
   it doesn't (`invalid_project_path`, `session_conflict`, `session_busy`,
@@ -514,6 +590,18 @@ DevBridge directly. Two things to get right:
 - Single-process, single-container: there is no clustering, no shared
   session store across replicas, and no queueing beyond the one-turn-at-a-
   time-per-`sessionId` lock described above.
+- No built-in concurrency cap. Different `sessionId`s run fully
+  concurrently — each spawns its own real `claude` process (plus a second
+  one for the MCP stub, when `tools` are given) — so the practical ceiling
+  is whatever's actually finite: host CPU/memory for however many
+  concurrent processes that is, and the authenticated account's own
+  Anthropic API rate limits (concurrent-request/tokens-per-minute caps
+  tied to the subscription), neither of which DevBridge can see or raise.
+  Scaling past one host means running more containers behind a load
+  balancer that routes a given `sessionId` consistently to the same one —
+  there's no shared state across replicas to make that automatic.
+- `usage` on a `stop`-triggered turn is necessarily partial — see
+  the `stop` field's own description above for why.
 
 ### `WS /api/session/stream`
 

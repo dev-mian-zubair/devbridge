@@ -1,4 +1,5 @@
 import { Router } from 'express'
+import os from 'node:os'
 import { withTimeout } from '../timeoutGuard.js'
 import { SessionConflictError, InvalidProjectPathError } from '../turnSessions.js'
 import { extractText, serializeHistory } from '../historySerializer.js'
@@ -296,12 +297,12 @@ export function createChatCompletionsRouter({ sessions, runner, timeoutMs, event
     // app-specific fields); body fields remain supported for existing
     // callers, with the header taking precedence when both are given.
     const sessionId = req.get('x-session-id') || req.body?.sessionId
-    const projectPath = req.get('x-project-path') || req.body?.projectPath
-    // Default is a plain chat/reasoning model, not the real Claude Code
-    // agent (see claudeCliRunner.js's CORRECTIVE_SYSTEM_PROMPT/
-    // DEFAULT_MODE_DISALLOWED_TOOLS) — any value other than exactly
-    // "coding" stays on that default, so a typo can't silently unlock it.
-    const agentMode = req.get('x-agent-mode') === 'coding' ? 'coding' : undefined
+    // projectPath only matters at all in the (now sole) plain-chat mode if
+    // the client actually cares about it — nothing touches the filesystem
+    // by default, so a fixed, always-present directory is a safe default
+    // when the client doesn't name one. An explicitly given path (even a
+    // bad one) always wins over this — the default only fills a true gap.
+    const projectPath = req.get('x-project-path') || req.body?.projectPath || os.tmpdir()
 
     const validation = validateRequest(req.body, sessionId, projectPath)
     if (validation.error) {
@@ -349,7 +350,6 @@ export function createChatCompletionsRouter({ sessions, runner, timeoutMs, event
       effort,
       jsonSchema,
       tools,
-      agentMode,
       requireToolUse,
       forcedToolName,
       stopSequences,
