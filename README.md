@@ -650,12 +650,16 @@ login is pending, and so does a safety timeout if neither fires.
 [`examples/`](examples) has minimal, runnable examples pointing real
 frameworks and SDKs at DevBridge: plain `curl` and the official `openai`
 SDK, the Vercel AI SDK, LangChain (with a full tool-calling round trip),
-and a Python deepagents agent. Each is self-contained with its own
-`package.json`/`requirements.txt`, and documents the one or two gotchas
-that framework has when pointed at a non-`api.openai.com` Chat Completions
+a Python deepagents agent, a Python CrewAI agent/task/crew, and a config
+patch registering DevBridge as a custom provider in the OpenClaw gateway.
+Each is self-contained with its own `package.json`/`requirements.txt`
+(or config file, for OpenClaw), and documents the one or two gotchas that
+framework has when pointed at a non-`api.openai.com` Chat Completions
 backend (e.g. the Vercel AI SDK's bare `openai()` provider silently
-targeting the Responses API, or deepagents' `"openai:..."` string
-shorthand ignoring any custom `base_url`).
+targeting the Responses API, deepagents' `"openai:..."` string shorthand
+ignoring any custom `base_url`, CrewAI's litellm-backed `LLM` needing a
+`"openai/<model>"` provider prefix, or OpenClaw not sending `X-Session-Id`
+unless its provider config says to).
 
 ## Non-functional / safety requirements
 

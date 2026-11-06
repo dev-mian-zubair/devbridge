@@ -1,0 +1,37 @@
+// OpenClaw config patch registering DevBridge as a custom model provider.
+//
+// Apply it with:
+//   openclaw config patch --file ./devbridge.patch.json5 --dry-run   # validate only
+//   openclaw config patch --file ./devbridge.patch.json5             # actually apply
+//
+// Adjust baseUrl if DevBridge isn't on the default host/port.
+{
+  models: {
+    mode: "merge", // merge (default) | replace — merge keeps any other providers you already have
+    providers: {
+      devbridge: {
+        baseUrl: "http://127.0.0.1:3000/v1",
+        apiKey: "devbridge-does-not-check-this", // any non-empty string — DevBridge has no credentials of its own
+        api: "openai-completions", // DevBridge only ever speaks Chat Completions
+        // Required: OpenClaw doesn't send X-Session-Id by default, and
+        // DevBridge rejects any request without one (400 invalid_request_error).
+        // A static header here is enough for a single-user local setup, since
+        // DevBridge only needs the id to be stable for one logical conversation.
+        headers: { "X-Session-Id": "openclaw-devbridge" },
+        models: [
+          {
+            id: "sonnet",
+            name: "DevBridge (Claude Sonnet, plain chat)",
+          },
+        ],
+      },
+    },
+  },
+  agents: {
+    defaults: {
+      // "<providerId>/<modelId>" — must match the provider id and the
+      // models[].id entry above.
+      model: { primary: "devbridge/sonnet" },
+    },
+  },
+}

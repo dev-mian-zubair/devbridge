@@ -11,6 +11,8 @@ own dependency tree.
 | [`vercel-ai-sdk/`](vercel-ai-sdk) | Vercel AI SDK via `createOpenAICompatible()`, including the gotcha that the bare `openai('model-id')` provider does **not** work. |
 | [`langchain/`](langchain) | LangChain's `ChatOpenAI`, with a full client-executes tool-calling round trip and streaming. |
 | [`deepagents/`](deepagents) | A deepagents agent (Python), including the gotcha that the `"openai:..."` model-string shorthand does **not** work. |
+| [`crewai/`](crewai) | A CrewAI agent/task/crew (Python), including the gotcha that the model string needs a litellm provider prefix (`"openai/sonnet"`, not `"sonnet"`). |
+| [`openclaw/`](openclaw) | A config patch registering DevBridge as a custom model provider in [OpenClaw](https://docs.openclaw.ai), including the gotcha that OpenClaw doesn't send `X-Session-Id` by default. |
 
 ## Before running any of them
 
