@@ -3,6 +3,30 @@ import { createMcpBridge as realCreateMcpBridge, MCP_SERVER_NAME } from './mcpBr
 
 const MCP_PREFIX = `mcp__${MCP_SERVER_NAME}__`
 
+// DevBridge's primary audience points at it expecting an OpenAI-compatible
+// chat model, not Claude Code itself — but the CLI's default persona and
+// full built-in tool surface (confirmed live, even against a fresh,
+// plugin-free config dir: this exact list) are both still "I am Claude
+// Code, an agentic coding tool" by default. Without correcting for that, a
+// plain chat/reasoning call (e.g. driving a non-coding LangGraph agent)
+// can get coding-flavored answers or have the model actually try to read
+// files / run shell commands that have nothing to do with the request.
+// This is the DEFAULT; a caller that genuinely wants the real agent
+// (tools, persona, and all) asks for it via agentMode: 'coding'.
+const DEFAULT_MODE_DISALLOWED_TOOLS = [
+  'Task', 'Bash', 'CronCreate', 'CronDelete', 'CronList', 'DesignSync', 'Edit',
+  'EnterWorktree', 'ExitWorktree', 'ListAgents', 'Monitor', 'NotebookEdit',
+  'PushNotification', 'Read', 'RemoteTrigger', 'ReportFindings', 'ScheduleWakeup',
+  'SendMessage', 'Skill', 'TaskStop', 'ToolSearch', 'WebFetch', 'WebSearch', 'Workflow', 'Write',
+]
+
+const CORRECTIVE_SYSTEM_PROMPT =
+  'You are being used as a general-purpose chat/reasoning model through an ' +
+  'OpenAI-compatible API, not as Claude Code, a coding agent in a project ' +
+  "directory. Don't reference files, repositories, codebases, or " +
+  "development tools unless the user's own message raises them. You have " +
+  'no file system or shell access in this context.'
+
 // Claude Code's `-p/--print` mode is its officially supported non-interactive
 // interface: `--output-format stream-json --include-partial-messages` emits
 // one JSON object per line, mirroring the Anthropic Messages API's own
@@ -27,7 +51,7 @@ function spawnEnv() {
   return rest
 }
 
-function buildArgs({ model, systemPrompt, effort, jsonSchema, mcpConfigPath, allowedToolNames }) {
+function buildArgs({ model, systemPrompt, effort, jsonSchema, mcpConfigPath, allowedToolNames, agentMode }) {
   const args = [
     '-p',
     '--output-format',
@@ -38,11 +62,25 @@ function buildArgs({ model, systemPrompt, effort, jsonSchema, mcpConfigPath, all
     'none',
   ]
   if (model) args.push('--model', model)
-  if (systemPrompt) args.push('--append-system-prompt', systemPrompt)
+
+  const isChatMode = agentMode !== 'coding'
+  const finalSystemPrompt = isChatMode
+    ? (systemPrompt ? `${CORRECTIVE_SYSTEM_PROMPT}\n\n${systemPrompt}` : CORRECTIVE_SYSTEM_PROMPT)
+    : systemPrompt
+  if (finalSystemPrompt) args.push('--append-system-prompt', finalSystemPrompt)
+
   if (effort) args.push('--effort', effort)
   if (jsonSchema) args.push('--json-schema', JSON.stringify(jsonSchema))
   if (mcpConfigPath) {
     args.push('--mcp-config', mcpConfigPath, '--strict-mcp-config', '--allowedTools', ...allowedToolNames)
+  }
+
+  // Chat mode's disallow list already includes Task, subsuming the
+  // tools-bearing-turn mitigation below — never push --disallowedTools
+  // twice for the same invocation.
+  if (isChatMode) {
+    args.push('--disallowedTools', ...DEFAULT_MODE_DISALLOWED_TOOLS)
+  } else if (mcpConfigPath) {
     // Defensive: whether a native subagent's (Task tool) own tool calls are
     // forwarded on this stream, and if so whether they're distinguishable
     // from the top-level turn's, is unverified. Disallowing Task outright
@@ -80,7 +118,7 @@ function signalProcessGroup(child, signal) {
 
 export function createClaudeCliRunner(spawnFn = spawn, { killGraceMs = 5000, createMcpBridge = realCreateMcpBridge } = {}) {
   return {
-    runTurn({ content, projectPath, model, systemPrompt, effort, jsonSchema, tools, onDelta, onToolCallDelta }) {
+    runTurn({ content, projectPath, model, systemPrompt, effort, jsonSchema, tools, agentMode, onDelta, onToolCallDelta }) {
       let mcpConfigPath = null
       let allowedToolNames = []
       let cleanupMcpBridge = null
@@ -91,7 +129,7 @@ export function createClaudeCliRunner(spawnFn = spawn, { killGraceMs = 5000, cre
         cleanupMcpBridge = bridge.cleanup
       }
 
-      const args = buildArgs({ model, systemPrompt, effort, jsonSchema, mcpConfigPath, allowedToolNames })
+      const args = buildArgs({ model, systemPrompt, effort, jsonSchema, mcpConfigPath, allowedToolNames, agentMode })
 
       let child
       try {

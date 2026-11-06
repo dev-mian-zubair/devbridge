@@ -121,22 +121,22 @@ describe('createClaudeCliRunner', () => {
     expect(args).not.toContain('--allowedTools')
   })
 
-  it('disallows Task on a tools-bearing turn (security review: unverified subagent risk mitigation)', () => {
+  it('in coding mode, disallows only Task on a tools-bearing turn (security review: unverified subagent risk mitigation)', () => {
     const child = fakeChild()
     const spawnFn = vi.fn(() => child)
     const fakeCreateMcpBridge = vi.fn(() => ({ mcpConfigPath: '/tmp/fake/mcp-config.json', allowedToolNames: ['mcp__client-tools__get_weather'], cleanup: vi.fn() }))
     const runner = createClaudeCliRunner(spawnFn, { createMcpBridge: fakeCreateMcpBridge })
     const tools = [{ type: 'function', function: { name: 'get_weather', parameters: {} } }]
-    runner.runTurn({ content: 'hi', projectPath: '/app/workspace/proj', tools })
+    runner.runTurn({ content: 'hi', projectPath: '/app/workspace/proj', tools, agentMode: 'coding' })
     const [, args] = spawnFn.mock.calls[0]
     expect(args[args.indexOf('--disallowedTools') + 1]).toBe('Task')
   })
 
-  it('does not pass --disallowedTools when no tools are given', () => {
+  it('in coding mode, does not pass --disallowedTools when no tools are given', () => {
     const child = fakeChild()
     const spawnFn = vi.fn(() => child)
     const runner = createClaudeCliRunner(spawnFn)
-    runner.runTurn({ content: 'hi', projectPath: '/app/workspace/proj' })
+    runner.runTurn({ content: 'hi', projectPath: '/app/workspace/proj', agentMode: 'coding' })
     const [, args] = spawnFn.mock.calls[0]
     expect(args).not.toContain('--disallowedTools')
   })
@@ -159,6 +159,99 @@ describe('createClaudeCliRunner', () => {
 
     child.emit('close', 0)
     expect(cleanup).toHaveBeenCalledTimes(1)
+  })
+
+  it('by default (no agentMode), disallows the entire built-in tool set, not just Task', () => {
+    const child = fakeChild()
+    const spawnFn = vi.fn(() => child)
+    const runner = createClaudeCliRunner(spawnFn)
+    runner.runTurn({ content: 'hi', projectPath: '/app/workspace/proj' })
+    const [, args] = spawnFn.mock.calls[0]
+    const idx = args.indexOf('--disallowedTools')
+    expect(idx).toBeGreaterThan(-1)
+    const names = args.slice(idx + 1)
+    const expected = [
+      'Task', 'Bash', 'CronCreate', 'CronDelete', 'CronList', 'DesignSync', 'Edit',
+      'EnterWorktree', 'ExitWorktree', 'ListAgents', 'Monitor', 'NotebookEdit',
+      'PushNotification', 'Read', 'RemoteTrigger', 'ReportFindings', 'ScheduleWakeup',
+      'SendMessage', 'Skill', 'TaskStop', 'ToolSearch', 'WebFetch', 'WebSearch', 'Workflow', 'Write',
+    ]
+    expect(new Set(names)).toEqual(new Set(expected))
+  })
+
+  it('by default (no agentMode), passes the full disallow list even with no tools given', () => {
+    const child = fakeChild()
+    const spawnFn = vi.fn(() => child)
+    const runner = createClaudeCliRunner(spawnFn)
+    runner.runTurn({ content: 'hi', projectPath: '/app/workspace/proj' })
+    const [, args] = spawnFn.mock.calls[0]
+    expect(args).toContain('--disallowedTools')
+    expect(args).toContain('Bash')
+  })
+
+  it('agentMode: "coding" with tools given disallows only Task, not the full default list', () => {
+    const child = fakeChild()
+    const spawnFn = vi.fn(() => child)
+    const fakeCreateMcpBridge = vi.fn(() => ({ mcpConfigPath: '/tmp/fake/mcp-config.json', allowedToolNames: ['mcp__client-tools__get_weather'], cleanup: vi.fn() }))
+    const runner = createClaudeCliRunner(spawnFn, { createMcpBridge: fakeCreateMcpBridge })
+    const tools = [{ type: 'function', function: { name: 'get_weather', parameters: {} } }]
+    runner.runTurn({ content: 'hi', projectPath: '/app/workspace/proj', tools, agentMode: 'coding' })
+    const [, args] = spawnFn.mock.calls[0]
+    const idx = args.indexOf('--disallowedTools')
+    const names = args.slice(idx + 1)
+    expect(names).toEqual(['Task'])
+  })
+
+  it('default mode + tools given: the full disallow list already covers Task, no duplicate --disallowedTools flag', () => {
+    const child = fakeChild()
+    const spawnFn = vi.fn(() => child)
+    const fakeCreateMcpBridge = vi.fn(() => ({ mcpConfigPath: '/tmp/fake/mcp-config.json', allowedToolNames: ['mcp__client-tools__get_weather'], cleanup: vi.fn() }))
+    const runner = createClaudeCliRunner(spawnFn, { createMcpBridge: fakeCreateMcpBridge })
+    const tools = [{ type: 'function', function: { name: 'get_weather', parameters: {} } }]
+    runner.runTurn({ content: 'hi', projectPath: '/app/workspace/proj', tools })
+    const [, args] = spawnFn.mock.calls[0]
+    expect(args.filter((a) => a === '--disallowedTools')).toHaveLength(1)
+    const idx = args.indexOf('--disallowedTools')
+    expect(args.slice(idx + 1)).toContain('Task')
+  })
+
+  it('injects the corrective system prompt by default, combined with a client-supplied one', () => {
+    const child = fakeChild()
+    const spawnFn = vi.fn(() => child)
+    const runner = createClaudeCliRunner(spawnFn)
+    runner.runTurn({ content: 'hi', projectPath: '/app/workspace/proj', systemPrompt: 'Be terse.' })
+    const [, args] = spawnFn.mock.calls[0]
+    const value = args[args.indexOf('--append-system-prompt') + 1]
+    expect(value).toContain('not as Claude Code')
+    expect(value).toContain('Be terse.')
+  })
+
+  it('injects the corrective system prompt alone when no client systemPrompt is given', () => {
+    const child = fakeChild()
+    const spawnFn = vi.fn(() => child)
+    const runner = createClaudeCliRunner(spawnFn)
+    runner.runTurn({ content: 'hi', projectPath: '/app/workspace/proj' })
+    const [, args] = spawnFn.mock.calls[0]
+    const value = args[args.indexOf('--append-system-prompt') + 1]
+    expect(value).toContain('not as Claude Code')
+  })
+
+  it('agentMode: "coding" skips the corrective system prompt entirely', () => {
+    const child = fakeChild()
+    const spawnFn = vi.fn(() => child)
+    const runner = createClaudeCliRunner(spawnFn)
+    runner.runTurn({ content: 'hi', projectPath: '/app/workspace/proj', systemPrompt: 'Be terse.', agentMode: 'coding' })
+    const [, args] = spawnFn.mock.calls[0]
+    expect(args[args.indexOf('--append-system-prompt') + 1]).toBe('Be terse.')
+  })
+
+  it('agentMode: "coding" with no systemPrompt at all passes no --append-system-prompt flag', () => {
+    const child = fakeChild()
+    const spawnFn = vi.fn(() => child)
+    const runner = createClaudeCliRunner(spawnFn)
+    runner.runTurn({ content: 'hi', projectPath: '/app/workspace/proj', agentMode: 'coding' })
+    const [, args] = spawnFn.mock.calls[0]
+    expect(args).not.toContain('--append-system-prompt')
   })
 
   it('writes the content to stdin and closes it', () => {
@@ -185,12 +278,12 @@ describe('createClaudeCliRunner', () => {
     expect(args[modelIndex + 1]).toBe('opus')
   })
 
-  it('passes --append-system-prompt when a systemPrompt is given', () => {
+  it('passes --append-system-prompt through unmodified in coding mode when a systemPrompt is given', () => {
     const child = fakeChild()
     const spawnFn = vi.fn(() => child)
     const runner = createClaudeCliRunner(spawnFn)
 
-    runner.runTurn({ content: 'hi', projectPath: '/app/workspace/proj', systemPrompt: 'Be terse.' })
+    runner.runTurn({ content: 'hi', projectPath: '/app/workspace/proj', systemPrompt: 'Be terse.', agentMode: 'coding' })
 
     const [, args] = spawnFn.mock.calls[0]
     const index = args.indexOf('--append-system-prompt')

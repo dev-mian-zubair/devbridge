@@ -251,6 +251,11 @@ export function createChatCompletionsRouter({ sessions, runner, timeoutMs, event
     // callers, with the header taking precedence when both are given.
     const sessionId = req.get('x-session-id') || req.body?.sessionId
     const projectPath = req.get('x-project-path') || req.body?.projectPath
+    // Default is a plain chat/reasoning model, not the real Claude Code
+    // agent (see claudeCliRunner.js's CORRECTIVE_SYSTEM_PROMPT/
+    // DEFAULT_MODE_DISALLOWED_TOOLS) — any value other than exactly
+    // "coding" stays on that default, so a typo can't silently unlock it.
+    const agentMode = req.get('x-agent-mode') === 'coding' ? 'coding' : undefined
 
     const validation = validateRequest(req.body, sessionId, projectPath)
     if (validation.error) {
@@ -298,6 +303,7 @@ export function createChatCompletionsRouter({ sessions, runner, timeoutMs, event
       effort,
       jsonSchema,
       tools,
+      agentMode,
     }
 
     if (stream) {

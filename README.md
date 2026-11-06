@@ -255,6 +255,29 @@ curl http://127.0.0.1:3000/v1/chat/completions \
   inside the container (400 `invalid_project_path` otherwise, checked
   *before* anything is spawned).
 
+**Agent mode — plain chat by default, not Claude Code**
+
+- By default, every request gets a corrected system prompt (telling the
+  model it's a plain chat/reasoning model via an OpenAI-compatible API,
+  not Claude Code working in a project directory) and every one of the
+  CLI's own built-in tools is disallowed (`--disallowedTools` with the
+  full list: `Bash`, `Edit`, `Write`, `Read`, `NotebookEdit`, `Task`,
+  `Skill`, `ToolSearch`, `WebFetch`, `WebSearch`, and the rest of the
+  orchestration/scheduling tools). This exists because DevBridge's own
+  CLI still defaults to its real persona and full tool surface underneath
+  — without correcting for that, a plain chat call (e.g. driving a
+  non-coding LangGraph agent) can get coding-flavored answers, or have
+  the model actually try to read files or run shell commands that have
+  nothing to do with the request.
+- Send `X-Agent-Mode: coding` to opt back into the real agent: the
+  corrected system prompt and the disallow list are both skipped, and you
+  get today's full Claude-Code-in-a-project behavior, tools included. Any
+  other header value (or no header) stays on the default.
+- Client-declared `tools` (OpenAI-style function-calling, below) work
+  independently of this and in either mode — a non-coding client can use
+  its own `tools` for real function-calling while native coding tools
+  stay suppressed.
+
 **Request fields**
 
 - `model` is optional and passed straight through to `--model` (accepts

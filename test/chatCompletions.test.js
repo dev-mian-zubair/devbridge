@@ -212,6 +212,41 @@ describe('POST /v1/chat/completions', () => {
     })
   })
 
+  describe('X-Agent-Mode header', () => {
+    it('defaults agentMode to undefined (plain chat) when the header is absent', async () => {
+      const runner = fakeRunner()
+      const { app } = appWith(runner)
+      const reqPromise = request(app).post('/v1/chat/completions').send({
+        sessionId: 's1', projectPath: '/app/workspace/proj', messages: [{ role: 'user', content: 'hi' }],
+      })
+      reqPromise.catch(() => {})
+      await waitForPending(runner)
+      expect(runner.pending[0].opts.agentMode).toBeUndefined()
+    })
+
+    it('passes agentMode "coding" when X-Agent-Mode: coding is set', async () => {
+      const runner = fakeRunner()
+      const { app } = appWith(runner)
+      const reqPromise = request(app).post('/v1/chat/completions')
+        .set('X-Agent-Mode', 'coding')
+        .send({ sessionId: 's1', projectPath: '/app/workspace/proj', messages: [{ role: 'user', content: 'hi' }] })
+      reqPromise.catch(() => {})
+      await waitForPending(runner)
+      expect(runner.pending[0].opts.agentMode).toBe('coding')
+    })
+
+    it('treats any other X-Agent-Mode value as the default (not "coding")', async () => {
+      const runner = fakeRunner()
+      const { app } = appWith(runner)
+      const reqPromise = request(app).post('/v1/chat/completions')
+        .set('X-Agent-Mode', 'bogus')
+        .send({ sessionId: 's1', projectPath: '/app/workspace/proj', messages: [{ role: 'user', content: 'hi' }] })
+      reqPromise.catch(() => {})
+      await waitForPending(runner)
+      expect(runner.pending[0].opts.agentMode).not.toBe('coding')
+    })
+  })
+
   it('returns 400 for a request missing a non-empty messages array', async () => {
     const runner = fakeRunner()
     const { app } = appWith(runner)
