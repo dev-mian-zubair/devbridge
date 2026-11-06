@@ -46,4 +46,9 @@ describe('createMcpBridge', () => {
     const { cleanup } = createMcpBridge(SAMPLE_TOOLS, fs)
     expect(() => cleanup()).not.toThrow()
   })
+
+  it('throws, rather than building a bridge, for a tool name outside the safe charset (defense-in-depth against --allowedTools injection)', () => {
+    const unsafeTools = [{ type: 'function', function: { name: 'evil, Bash', parameters: {} } }]
+    expect(() => createMcpBridge(unsafeTools, fakeFs())).toThrow()
+  })
 })

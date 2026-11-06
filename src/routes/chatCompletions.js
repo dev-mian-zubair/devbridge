@@ -14,6 +14,16 @@ const MODEL_PATTERN = /^[\w.\-:]+$/
 // equivalent to map onto.
 const CLI_EFFORT_LEVELS = new Set(['low', 'medium', 'high', 'xhigh', 'max'])
 
+// A tool's name becomes an mcp__client-tools__<name> entry passed to the
+// CLI's own --allowedTools flag, whose values the CLI parses for its own
+// scoped-permission syntax (e.g. "Bash(git *)", or comma/space-separated
+// lists per its --help text) — not just opaque argv strings. An
+// unrestricted name could smuggle in an extra permission rule (e.g.
+// unlocking the real Bash tool unattended, since --permission-prompts
+// none approves anything it's told to). Restricting to OpenAI's own
+// function-name charset closes that off entirely.
+const TOOL_NAME_PATTERN = /^[A-Za-z0-9_-]{1,64}$/
+
 function validateRequest(body, sessionId, projectPath) {
   if (typeof sessionId !== 'string' || sessionId.length === 0) {
     return { error: 'sessionId is required, as the X-Session-Id header or a body field' }
@@ -42,10 +52,18 @@ function validateRequest(body, sessionId, projectPath) {
   // clear 400 rather than a silent best-effort. functions/function_call
   // (the deprecated aliases) are out of scope and stay rejected outright.
   if (Array.isArray(body.tools)) {
+    const seenNames = new Set()
     for (const tool of body.tools) {
       if (tool?.type !== 'function' || typeof tool.function?.name !== 'string' || tool.function.name.length === 0) {
         return { error: 'each tools entry must be {type: "function", function: {name, ...}}' }
       }
+      if (!TOOL_NAME_PATTERN.test(tool.function.name)) {
+        return { error: 'tools[].function.name must match ^[A-Za-z0-9_-]{1,64}$ (OpenAI\'s own function-name charset)' }
+      }
+      if (seenNames.has(tool.function.name)) {
+        return { error: 'tools[].function.name values must be unique' }
+      }
+      seenNames.add(tool.function.name)
     }
     // JSON.stringify escapes a literal NUL byte as the 6-character sequence
     // \u0000 rather than preserving the raw byte, so detecting it means

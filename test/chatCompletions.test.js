@@ -486,6 +486,58 @@ describe('POST /v1/chat/completions', () => {
       expect(runner.pending).toHaveLength(0)
     })
 
+    it('rejects a tool name containing characters that could inject an extra --allowedTools permission rule (security)', async () => {
+      const runner = fakeRunner()
+      const { app } = appWith(runner)
+      const res = await request(app).post('/v1/chat/completions').send({
+        sessionId: 's1', projectPath: '/app/workspace/proj',
+        messages: [{ role: 'user', content: 'hi' }],
+        tools: [{ type: 'function', function: { name: 'evil, Bash' } }],
+      })
+      expect(res.status).toBe(400)
+      expect(runner.pending).toHaveLength(0)
+    })
+
+    it('rejects a tool name containing parentheses (could be parsed as a scoped permission pattern)', async () => {
+      const runner = fakeRunner()
+      const { app } = appWith(runner)
+      const res = await request(app).post('/v1/chat/completions').send({
+        sessionId: 's1', projectPath: '/app/workspace/proj',
+        messages: [{ role: 'user', content: 'hi' }],
+        tools: [{ type: 'function', function: { name: 'get_weather(evil)' } }],
+      })
+      expect(res.status).toBe(400)
+      expect(runner.pending).toHaveLength(0)
+    })
+
+    it('accepts a tool name using only the safe OpenAI function-name charset', async () => {
+      const runner = fakeRunner()
+      const { app } = appWith(runner)
+      const reqPromise = request(app).post('/v1/chat/completions').send({
+        sessionId: 's1', projectPath: '/app/workspace/proj',
+        messages: [{ role: 'user', content: 'hi' }],
+        tools: [{ type: 'function', function: { name: 'get_weather-v2_final' } }],
+      })
+      reqPromise.catch(() => {})
+      await waitForPending(runner)
+      expect(runner.pending[0].opts.tools).toEqual([{ type: 'function', function: { name: 'get_weather-v2_final' } }])
+    })
+
+    it('rejects a tools array with duplicate function names', async () => {
+      const runner = fakeRunner()
+      const { app } = appWith(runner)
+      const res = await request(app).post('/v1/chat/completions').send({
+        sessionId: 's1', projectPath: '/app/workspace/proj',
+        messages: [{ role: 'user', content: 'hi' }],
+        tools: [
+          { type: 'function', function: { name: 'get_weather' } },
+          { type: 'function', function: { name: 'get_weather' } },
+        ],
+      })
+      expect(res.status).toBe(400)
+      expect(runner.pending).toHaveLength(0)
+    })
+
     it('tool_choice "none" does not pass tools through to the runner, even if tools is non-empty', async () => {
       const runner = fakeRunner()
       const { app } = appWith(runner)
