@@ -6,13 +6,15 @@ import { createTurnEvents } from './turnEvents.js'
 export { SessionConflictError, InvalidProjectPathError }
 
 // Unlike the PTY-backed login session, a turn session has no live process
-// to keep around between requests: each turn is one `claude -p` invocation,
-// and continuity across turns comes from the CLI's own --resume, keyed on
-// the claudeSessionId it hands back. This store remembers that mapping,
-// which projectPath a given API sessionId is bound to, and enough of each
-// session's recent activity (status, last request, last result/error) for
-// the dashboard's observability view — publishing a session:update event
-// through `events` on every mutation so WS subscribers stay in sync.
+// to keep around between requests: each turn is a fresh `claude -p`
+// invocation (no --resume/--session-id), and continuity across turns is the
+// client's job — it replays the full conversation history on every call.
+// This store just remembers which projectPath a given API sessionId is
+// bound to, the claudeSessionId the CLI last handed back (for display
+// only, never used to resume), and enough of each session's recent
+// activity (status, last request, last result/error) for the dashboard's
+// observability view — publishing a session:update event through `events`
+// on every mutation so WS subscribers stay in sync.
 export function createTurnSessions(statFn = fs.statSync, events = createTurnEvents()) {
   const sessions = new Map()
 
