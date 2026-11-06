@@ -9,8 +9,7 @@ DevBridge is a local-only developer tool that wraps the official
 chat-completions endpoint, a WebSocket terminal stream, and a minimal admin
 dashboard — all in a single Docker container.
 
-*(Screenshot of the dashboard: add one at `docs/screenshot.png` and
-reference it here with `![DevBridge dashboard](docs/screenshot.png)`.)*
+![DevBridge dashboard](docs/screenshot.png)
 
 ## Contents
 
@@ -681,18 +680,151 @@ login is pending, and so does a safety timeout if neither fires.
 ## Examples
 
 [`examples/`](examples) has minimal, runnable examples pointing real
-frameworks and SDKs at DevBridge: plain `curl` and the official `openai`
-SDK, the Vercel AI SDK, LangChain (with a full tool-calling round trip),
-a Python deepagents agent, a Python CrewAI agent/task/crew, and a config
-patch registering DevBridge as a custom provider in the OpenClaw gateway.
-Each is self-contained with its own `package.json`/`requirements.txt`
-(or config file, for OpenClaw), and documents the one or two gotchas that
-framework has when pointed at a non-`api.openai.com` Chat Completions
-backend (e.g. the Vercel AI SDK's bare `openai()` provider silently
-targeting the Responses API, deepagents' `"openai:..."` string shorthand
-ignoring any custom `base_url`, CrewAI's litellm-backed `LLM` needing a
-`"openai/<model>"` provider prefix, or OpenClaw not sending `X-Session-Id`
-unless its provider config says to).
+frameworks and SDKs at DevBridge — each self-contained with its own
+`package.json`/`requirements.txt` (or config file, for OpenClaw), and
+live-verified against a running DevBridge instance.
+
+[![OpenAI SDK](https://img.shields.io/badge/OpenAI_SDK-000000?logo=openai&logoColor=white)](examples/basic-http)
+[![Vercel AI SDK](https://img.shields.io/badge/Vercel_AI_SDK-000000?logo=vercel&logoColor=white)](examples/vercel-ai-sdk)
+[![LangChain](https://img.shields.io/badge/LangChain-1C3C3C?logo=langchain&logoColor=white)](examples/langchain)
+[![deepagents](https://img.shields.io/badge/deepagents-3776AB?logo=python&logoColor=white)](examples/deepagents)
+[![CrewAI](https://img.shields.io/badge/CrewAI-FF5A1F?logoColor=white)](examples/crewai)
+[![OpenClaw](https://img.shields.io/badge/OpenClaw-6E56CF?logoColor=white)](examples/openclaw)
+
+### OpenAI SDK & `curl`
+
+The official `openai` SDK, pointed at DevBridge exactly like `api.openai.com`:
+
+```js
+import OpenAI from 'openai'
+
+const client = new OpenAI({
+  baseURL: 'http://127.0.0.1:3000/v1',
+  apiKey: 'devbridge-does-not-check-this',
+  defaultHeaders: { 'X-Session-Id': 'my-session' },
+})
+
+const { choices } = await client.chat.completions.create({
+  model: 'sonnet',
+  messages: [{ role: 'user', content: 'Reply with exactly one word: OK' }],
+})
+console.log(choices[0].message.content)
+```
+
+→ Full example (plus a plain `curl` call and streaming): [`examples/basic-http`](examples/basic-http)
+
+### Vercel AI SDK
+
+Gotcha: the bare `openai('model-id')` provider targets OpenAI's Responses
+API even with a custom `baseURL` — use `createOpenAICompatible()` instead:
+
+```js
+import { createOpenAICompatible } from '@ai-sdk/openai-compatible'
+import { generateText } from 'ai'
+
+const devbridge = createOpenAICompatible({
+  name: 'devbridge',
+  baseURL: 'http://127.0.0.1:3000/v1',
+  apiKey: 'devbridge-does-not-check-this',
+  headers: { 'X-Session-Id': 'my-session' },
+})
+
+const { text } = await generateText({
+  model: devbridge.chatModel('sonnet'),
+  prompt: 'Reply with exactly one word: OK',
+})
+```
+
+→ Full example (plus streaming): [`examples/vercel-ai-sdk`](examples/vercel-ai-sdk)
+
+### LangChain
+
+A full client-executes tool-calling round trip — the model proposes a
+call, this script runs the real function, the result goes back in a
+follow-up request:
+
+```js
+import { ChatOpenAI } from '@langchain/openai'
+
+const model = new ChatOpenAI({
+  model: 'sonnet',
+  apiKey: 'devbridge-does-not-check-this',
+  configuration: {
+    baseURL: 'http://127.0.0.1:3000/v1',
+    defaultHeaders: { 'X-Session-Id': 'my-session' },
+  },
+})
+
+const modelWithTools = model.bindTools([getWeatherTool])
+```
+
+→ Full example (tool-calling loop + streaming): [`examples/langchain`](examples/langchain)
+
+### deepagents (Python)
+
+Gotcha: the `"openai:..."` model-string shorthand always targets the real
+OpenAI API and ignores any custom `base_url` — pass a pre-built
+`ChatOpenAI` instance instead:
+
+```python
+from deepagents import create_deep_agent
+from langchain_openai import ChatOpenAI
+
+model = ChatOpenAI(
+    base_url="http://127.0.0.1:3000/v1",
+    api_key="devbridge-does-not-check-this",
+    model="sonnet",
+    default_headers={"X-Session-Id": "my-session"},
+)
+
+agent = create_deep_agent(model=model, tools=[])
+```
+
+→ Full example: [`examples/deepagents`](examples/deepagents)
+
+### CrewAI (Python)
+
+Gotcha: CrewAI's `LLM` class is litellm-backed, which identifies a backend
+from a `"<provider>/<model>"` string — a bare `"sonnet"` makes litellm
+guess the wrong provider:
+
+```python
+from crewai import Agent, LLM
+
+llm = LLM(
+    model="openai/sonnet",  # not just "sonnet"
+    base_url="http://127.0.0.1:3000/v1",
+    api_key="devbridge-does-not-check-this",
+    extra_headers={"X-Session-Id": "my-session"},
+)
+
+writer = Agent(role="...", goal="...", backstory="...", llm=llm)
+```
+
+→ Full example (Agent/Task/Crew): [`examples/crewai`](examples/crewai)
+
+### OpenClaw
+
+Not a script — a config patch registering DevBridge as a custom model
+provider in the [OpenClaw](https://docs.openclaw.ai) gateway. Gotcha: its
+adapter doesn't send `X-Session-Id` by default, which DevBridge requires:
+
+```json5
+devbridge: {
+  baseUrl: "http://127.0.0.1:3000/v1",
+  apiKey: "devbridge-does-not-check-this",
+  api: "openai-completions",
+  headers: { "X-Session-Id": "openclaw-devbridge" },
+  models: [{ id: "sonnet", name: "DevBridge (Claude Sonnet, plain chat)" }],
+}
+```
+
+→ Full example: [`examples/openclaw`](examples/openclaw)
+
+---
+
+See [`examples/README.md`](examples/README.md) for the setup steps shared
+across all of them (start DevBridge, sign in once, `DEVBRIDGE_URL` override).
 
 ## Non-functional / safety requirements
 
