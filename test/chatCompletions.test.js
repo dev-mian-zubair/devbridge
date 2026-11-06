@@ -343,6 +343,60 @@ describe('POST /v1/chat/completions', () => {
     expect(res.body.error.type).toBe('invalid_request_error')
   })
 
+  it('accepts a single stop string, normalizing it into stopSequences', async () => {
+    const runner = fakeRunner()
+    const { app } = appWith(runner)
+    const reqPromise = request(app).post('/v1/chat/completions').send({
+      sessionId: 's1', projectPath: '/app/workspace/proj', stop: 'STOP',
+      messages: [{ role: 'user', content: 'hi' }],
+    })
+    reqPromise.catch(() => {})
+    await waitForPending(runner)
+    expect(runner.pending[0].opts.stopSequences).toEqual(['STOP'])
+  })
+
+  it('accepts an array of up to 4 stop strings', async () => {
+    const runner = fakeRunner()
+    const { app } = appWith(runner)
+    const reqPromise = request(app).post('/v1/chat/completions').send({
+      sessionId: 's1', projectPath: '/app/workspace/proj', stop: ['A', 'B', 'C', 'D'],
+      messages: [{ role: 'user', content: 'hi' }],
+    })
+    reqPromise.catch(() => {})
+    await waitForPending(runner)
+    expect(runner.pending[0].opts.stopSequences).toEqual(['A', 'B', 'C', 'D'])
+  })
+
+  it('rejects more than 4 stop strings', async () => {
+    const runner = fakeRunner()
+    const { app } = appWith(runner)
+    const res = await request(app).post('/v1/chat/completions').send({
+      sessionId: 's1', projectPath: '/app/workspace/proj', stop: ['A', 'B', 'C', 'D', 'E'],
+      messages: [{ role: 'user', content: 'hi' }],
+    })
+    expect(res.status).toBe(400)
+  })
+
+  it('rejects an empty string in stop', async () => {
+    const runner = fakeRunner()
+    const { app } = appWith(runner)
+    const res = await request(app).post('/v1/chat/completions').send({
+      sessionId: 's1', projectPath: '/app/workspace/proj', stop: [''],
+      messages: [{ role: 'user', content: 'hi' }],
+    })
+    expect(res.status).toBe(400)
+  })
+
+  it('rejects a stop string containing a NUL byte', async () => {
+    const runner = fakeRunner()
+    const { app } = appWith(runner)
+    const res = await request(app).post('/v1/chat/completions').send({
+      sessionId: 's1', projectPath: '/app/workspace/proj', stop: 'bad\u0000stop',
+      messages: [{ role: 'user', content: 'hi' }],
+    })
+    expect(res.status).toBe(400)
+  })
+
   it('rejects a system message containing a NUL byte', async () => {
     const runner = fakeRunner()
     const { app } = appWith(runner)
@@ -566,17 +620,6 @@ describe('POST /v1/chat/completions', () => {
       expect(runner.pending[0].opts.tools).toEqual([{ type: 'function', function: { name: 'get_weather', parameters: { type: 'object' } } }])
     })
 
-    it('rejects tool_choice: "required" with 400', async () => {
-      const runner = fakeRunner()
-      const { app } = appWith(runner)
-      const res = await request(app).post('/v1/chat/completions').send({
-        sessionId: 's1', projectPath: '/app/workspace/proj',
-        messages: [{ role: 'user', content: 'hi' }],
-        tools: [{ type: 'function', function: { name: 'get_weather' } }],
-        tool_choice: 'required',
-      })
-      expect(res.status).toBe(400)
-    })
 
     it('rejects a tool with a NUL byte in its name with 400 (Review Focus)', async () => {
       const runner = fakeRunner()
@@ -640,6 +683,62 @@ describe('POST /v1/chat/completions', () => {
       })
       expect(res.status).toBe(400)
       expect(runner.pending).toHaveLength(0)
+    })
+
+    it('accepts tool_choice "required" with a non-empty tools array, passing requireToolUse through', async () => {
+      const runner = fakeRunner()
+      const { app } = appWith(runner)
+      const reqPromise = request(app).post('/v1/chat/completions').send({
+        sessionId: 's1', projectPath: '/app/workspace/proj',
+        messages: [{ role: 'user', content: 'hi' }],
+        tools: [{ type: 'function', function: { name: 'get_weather' } }],
+        tool_choice: 'required',
+      })
+      reqPromise.catch(() => {})
+      await waitForPending(runner)
+      expect(runner.pending[0].opts.requireToolUse).toBe(true)
+      expect(runner.pending[0].opts.forcedToolName).toBeUndefined()
+    })
+
+    it('rejects tool_choice "required" with no tools given', async () => {
+      const runner = fakeRunner()
+      const { app } = appWith(runner)
+      const res = await request(app).post('/v1/chat/completions').send({
+        sessionId: 's1', projectPath: '/app/workspace/proj',
+        messages: [{ role: 'user', content: 'hi' }],
+        tool_choice: 'required',
+      })
+      expect(res.status).toBe(400)
+    })
+
+    it('accepts a forced named-tool tool_choice object, passing forcedToolName through', async () => {
+      const runner = fakeRunner()
+      const { app } = appWith(runner)
+      const reqPromise = request(app).post('/v1/chat/completions').send({
+        sessionId: 's1', projectPath: '/app/workspace/proj',
+        messages: [{ role: 'user', content: 'hi' }],
+        tools: [
+          { type: 'function', function: { name: 'get_weather' } },
+          { type: 'function', function: { name: 'get_time' } },
+        ],
+        tool_choice: { type: 'function', function: { name: 'get_time' } },
+      })
+      reqPromise.catch(() => {})
+      await waitForPending(runner)
+      expect(runner.pending[0].opts.requireToolUse).toBe(true)
+      expect(runner.pending[0].opts.forcedToolName).toBe('get_time')
+    })
+
+    it('rejects a forced named-tool tool_choice naming a tool not present in tools', async () => {
+      const runner = fakeRunner()
+      const { app } = appWith(runner)
+      const res = await request(app).post('/v1/chat/completions').send({
+        sessionId: 's1', projectPath: '/app/workspace/proj',
+        messages: [{ role: 'user', content: 'hi' }],
+        tools: [{ type: 'function', function: { name: 'get_weather' } }],
+        tool_choice: { type: 'function', function: { name: 'nonexistent' } },
+      })
+      expect(res.status).toBe(400)
     })
 
     it('tool_choice "none" does not pass tools through to the runner, even if tools is non-empty', async () => {

@@ -51,7 +51,7 @@ function spawnEnv() {
   return rest
 }
 
-function buildArgs({ model, systemPrompt, effort, jsonSchema, mcpConfigPath, allowedToolNames, agentMode }) {
+function buildArgs({ model, systemPrompt, effort, jsonSchema, mcpConfigPath, allowedToolNames, agentMode, requireToolUse, forcedToolName }) {
   const args = [
     '-p',
     '--output-format',
@@ -64,15 +64,31 @@ function buildArgs({ model, systemPrompt, effort, jsonSchema, mcpConfigPath, all
   if (model) args.push('--model', model)
 
   const isChatMode = agentMode !== 'coding'
-  const finalSystemPrompt = isChatMode
-    ? (systemPrompt ? `${CORRECTIVE_SYSTEM_PROMPT}\n\n${systemPrompt}` : CORRECTIVE_SYSTEM_PROMPT)
-    : systemPrompt
+  const promptParts = []
+  if (isChatMode) promptParts.push(CORRECTIVE_SYSTEM_PROMPT)
+  if (systemPrompt) promptParts.push(systemPrompt)
+  if (requireToolUse) {
+    // Best-effort only — there's no CLI flag that forces a tool call the
+    // way OpenAI's real tool_choice: "required" guarantees one. A forced
+    // named tool also narrows --allowedTools below, which gets closer to
+    // deterministic than the generic case (nothing else to call), but
+    // neither is a hard guarantee; documented as such in the README.
+    promptParts.push(
+      forcedToolName
+        ? `You must call the "${forcedToolName}" tool in this turn — one of the client-declared tools available to you, not your own built-in tools. Do not respond with only text.`
+        : 'You must call one of the client-declared tools available to you in this turn — not your own built-in tools. Do not respond with only text.'
+    )
+  }
+  const finalSystemPrompt = promptParts.length > 0 ? promptParts.join('\n\n') : undefined
   if (finalSystemPrompt) args.push('--append-system-prompt', finalSystemPrompt)
 
   if (effort) args.push('--effort', effort)
   if (jsonSchema) args.push('--json-schema', JSON.stringify(jsonSchema))
   if (mcpConfigPath) {
-    args.push('--mcp-config', mcpConfigPath, '--strict-mcp-config', '--allowedTools', ...allowedToolNames)
+    const effectiveAllowedToolNames = forcedToolName
+      ? allowedToolNames.filter((name) => name === `${MCP_PREFIX}${forcedToolName}`)
+      : allowedToolNames
+    args.push('--mcp-config', mcpConfigPath, '--strict-mcp-config', '--allowedTools', ...effectiveAllowedToolNames)
   }
 
   // Chat mode's disallow list already includes Task, subsuming the
@@ -91,6 +107,18 @@ function buildArgs({ model, systemPrompt, effort, jsonSchema, mcpConfigPath, all
     args.push('--disallowedTools', 'Task')
   }
   return args
+}
+
+// The earliest-positioned match across all stop sequences wins — matching
+// real OpenAI's behavior when more than one sequence could apply. -1 means
+// none of them appear yet.
+function findEarliestStopIndex(text, stopSequences) {
+  let earliest = -1
+  for (const seq of stopSequences) {
+    const idx = text.indexOf(seq)
+    if (idx !== -1 && (earliest === -1 || idx < earliest)) earliest = idx
+  }
+  return earliest
 }
 
 // Signals the whole process group the CLI's child process leads (spawned
@@ -118,7 +146,7 @@ function signalProcessGroup(child, signal) {
 
 export function createClaudeCliRunner(spawnFn = spawn, { killGraceMs = 5000, createMcpBridge = realCreateMcpBridge } = {}) {
   return {
-    runTurn({ content, projectPath, model, systemPrompt, effort, jsonSchema, tools, agentMode, onDelta, onToolCallDelta }) {
+    runTurn({ content, projectPath, model, systemPrompt, effort, jsonSchema, tools, agentMode, stopSequences = [], requireToolUse, forcedToolName, onDelta, onToolCallDelta }) {
       let mcpConfigPath = null
       let allowedToolNames = []
       let cleanupMcpBridge = null
@@ -129,7 +157,7 @@ export function createClaudeCliRunner(spawnFn = spawn, { killGraceMs = 5000, cre
         cleanupMcpBridge = bridge.cleanup
       }
 
-      const args = buildArgs({ model, systemPrompt, effort, jsonSchema, mcpConfigPath, allowedToolNames, agentMode })
+      const args = buildArgs({ model, systemPrompt, effort, jsonSchema, mcpConfigPath, allowedToolNames, agentMode, requireToolUse, forcedToolName })
 
       let child
       try {
@@ -148,6 +176,7 @@ export function createClaudeCliRunner(spawnFn = spawn, { killGraceMs = 5000, cre
       let settled = false
       let exited = false
       let capturedModel = null
+      let capturedUsage = null
 
       child.on('close', () => {
         exited = true
@@ -193,6 +222,11 @@ export function createClaudeCliRunner(spawnFn = spawn, { killGraceMs = 5000, cre
 
           if (event.type === 'stream_event' && event.event?.type === 'message_start') {
             capturedModel = event.event.message?.model ?? capturedModel
+            // The only usage snapshot available if a stop sequence cuts this
+            // message short before its own message_delta ever arrives —
+            // honestly partial (mostly prompt-side tokens), not a lie: it
+            // reflects what had actually happened at the point we stopped.
+            capturedUsage = event.event.message?.usage ?? capturedUsage
             currentBlocks = new Map()
             currentText = ''
             return
@@ -239,8 +273,30 @@ export function createClaudeCliRunner(spawnFn = spawn, { killGraceMs = 5000, cre
             event.event?.type === 'content_block_delta' &&
             event.event.delta?.type === 'text_delta'
           ) {
-            currentText += event.event.delta.text
-            onDelta?.(event.event.delta.text)
+            const fragment = event.event.delta.text
+            const previousLength = currentText.length
+            currentText += fragment
+
+            const stopIndex = findEarliestStopIndex(currentText, stopSequences)
+            if (stopIndex !== -1) {
+              const truncated = currentText.slice(0, stopIndex)
+              const visiblePart = truncated.length > previousLength ? truncated.slice(previousLength) : ''
+              if (visiblePart) onDelta?.(visiblePart)
+              settleResolve({
+                text: truncated,
+                usage: capturedUsage,
+                totalCostUsd: null,
+                claudeSessionId: null,
+                isError: false,
+                stopReason: 'stop_sequence',
+                subtype: null,
+                model: capturedModel,
+              })
+              killNow()
+              return
+            }
+
+            onDelta?.(fragment)
             return
           }
 

@@ -254,6 +254,40 @@ describe('createClaudeCliRunner', () => {
     expect(args).not.toContain('--append-system-prompt')
   })
 
+  it('requireToolUse appends a "must call a tool" instruction to the system prompt', () => {
+    const child = fakeChild()
+    const spawnFn = vi.fn(() => child)
+    const fakeCreateMcpBridge = vi.fn(() => ({ mcpConfigPath: '/tmp/fake/mcp-config.json', allowedToolNames: ['mcp__client-tools__get_weather'], cleanup: vi.fn() }))
+    const runner = createClaudeCliRunner(spawnFn, { createMcpBridge: fakeCreateMcpBridge })
+    const tools = [{ type: 'function', function: { name: 'get_weather', parameters: {} } }]
+    runner.runTurn({ content: 'hi', projectPath: '/app/workspace/proj', tools, requireToolUse: true, agentMode: 'coding' })
+    const [, args] = spawnFn.mock.calls[0]
+    const value = args[args.indexOf('--append-system-prompt') + 1]
+    expect(value).toContain('must call')
+  })
+
+  it('forcedToolName narrows --allowedTools to just that one tool', () => {
+    const child = fakeChild()
+    const spawnFn = vi.fn(() => child)
+    const fakeCreateMcpBridge = vi.fn(() => ({
+      mcpConfigPath: '/tmp/fake/mcp-config.json',
+      allowedToolNames: ['mcp__client-tools__get_weather', 'mcp__client-tools__get_time'],
+      cleanup: vi.fn(),
+    }))
+    const runner = createClaudeCliRunner(spawnFn, { createMcpBridge: fakeCreateMcpBridge })
+    const tools = [
+      { type: 'function', function: { name: 'get_weather', parameters: {} } },
+      { type: 'function', function: { name: 'get_time', parameters: {} } },
+    ]
+    runner.runTurn({ content: 'hi', projectPath: '/app/workspace/proj', tools, requireToolUse: true, forcedToolName: 'get_time', agentMode: 'coding' })
+    const [, args] = spawnFn.mock.calls[0]
+    const idx = args.indexOf('--allowedTools')
+    expect(args[idx + 1]).toBe('mcp__client-tools__get_time')
+    expect(args[idx + 2]).not.toBe('mcp__client-tools__get_weather')
+    const promptValue = args[args.indexOf('--append-system-prompt') + 1]
+    expect(promptValue).toContain('get_time')
+  })
+
   it('writes the content to stdin and closes it', () => {
     const child = fakeChild()
     const spawnFn = vi.fn(() => child)
@@ -582,6 +616,66 @@ describe('createClaudeCliRunner', () => {
     const outcome = await promise
 
     expect(outcome.text).toBe('Let me check the weather.')
+  })
+
+  it('truncates text at the first stop sequence match, kills the process, and resolves with stopReason stop_sequence', async () => {
+    const child = fakeChild()
+    const spawnFn = vi.fn(() => child)
+    const runner = createClaudeCliRunner(spawnFn)
+    const { promise } = runner.runTurn({ content: 'hi', projectPath: '/app/workspace/proj', stopSequences: ['STOP'] })
+
+    child.stdout.emit('data', deltaLine('Hello STOP world'))
+    const outcome = await promise
+
+    expect(outcome.text).toBe('Hello ')
+    expect(outcome.stopReason).toBe('stop_sequence')
+    expect(outcome.isError).toBe(false)
+  })
+
+  it('does not truncate or resolve early when no stop sequence matches', async () => {
+    const child = fakeChild()
+    const spawnFn = vi.fn(() => child)
+    const runner = createClaudeCliRunner(spawnFn)
+    const { promise } = runner.runTurn({ content: 'hi', projectPath: '/app/workspace/proj', stopSequences: ['STOP'] })
+
+    child.stdout.emit('data', deltaLine('Hello world, no match here.'))
+    child.stdout.emit('data', resultLine({ result: 'Hello world, no match here.' }))
+    const outcome = await promise
+
+    expect(outcome.text).toBe('Hello world, no match here.')
+    expect(outcome.stopReason).toBe('end_turn')
+  })
+
+  it('detects a stop sequence that only completes across two chunks', async () => {
+    const child = fakeChild()
+    const spawnFn = vi.fn(() => child)
+    const runner = createClaudeCliRunner(spawnFn)
+    const onDelta = vi.fn()
+    const { promise } = runner.runTurn({ content: 'hi', projectPath: '/app/workspace/proj', stopSequences: ['STOP'], onDelta })
+
+    child.stdout.emit('data', deltaLine('Hello ST'))
+    child.stdout.emit('data', deltaLine('OP world'))
+    const outcome = await promise
+
+    expect(outcome.text).toBe('Hello ')
+    // Documented, accepted limitation: the "ST" fragment was already flushed
+    // via onDelta before the match completed in the next chunk — a
+    // streaming client sees it, even though the final (non-streaming)
+    // outcome.text is correctly truncated.
+    expect(onDelta.mock.calls[0]).toEqual(['Hello ST'])
+    expect(onDelta).toHaveBeenCalledTimes(1)
+  })
+
+  it('resolves at the earliest-matching stop sequence when multiple are given', async () => {
+    const child = fakeChild()
+    const spawnFn = vi.fn(() => child)
+    const runner = createClaudeCliRunner(spawnFn)
+    const { promise } = runner.runTurn({ content: 'hi', projectPath: '/app/workspace/proj', stopSequences: ['BB', 'A'] })
+
+    child.stdout.emit('data', deltaLine('xxAxxBByyy'))
+    const outcome = await promise
+
+    expect(outcome.text).toBe('xx')
   })
 
   it('reports tool_calls index as a 0-based ordinal among MCP blocks, not the raw Anthropic content-block index (security review #2)', async () => {

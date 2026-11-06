@@ -329,7 +329,7 @@ falls into one of four buckets:
 
 | Supported & mapped | Accepted, silently ignored | Mapped to a real CLI flag | Rejected (400) |
 |---|---|---|---|
-| `model`, `messages`, `stream`, `stream_options.include_usage`, `tools`, `tool_choice` (`auto`/`none` only) | `temperature`, `top_p`, `frequency_penalty`, `presence_penalty`, `logit_bias`, `seed`, `user`/`prompt_cache_key`, `metadata`, `store`, `service_tier`, `prediction`, `moderation`, `parallel_tool_calls`, `safety_identifier`, `max_tokens`/`max_completion_tokens`, `modalities: ["text"]`, `logprobs: false` | `reasoning_effort` → `--effort`; `response_format` (`json_schema` variant) → `--json-schema`; `tools` → a per-request `--mcp-config` (see below) | `tool_choice: "required"` or a forced named tool, `functions`, `function_call`, `n > 1`, `logprobs: true`, `top_logprobs`, `modalities` containing anything other than `"text"`, `audio` |
+| `model`, `messages`, `stream`, `stream_options.include_usage`, `tools`, `tool_choice` (all four forms), `stop` | `temperature`, `top_p`, `frequency_penalty`, `presence_penalty`, `logit_bias`, `seed`, `user`/`prompt_cache_key`, `metadata`, `store`, `service_tier`, `prediction`, `moderation`, `parallel_tool_calls`, `safety_identifier`, `max_tokens`/`max_completion_tokens`, `modalities: ["text"]`, `logprobs: false` | `reasoning_effort` → `--effort`; `response_format` (`json_schema` variant) → `--json-schema`; `tools` → a per-request `--mcp-config` (see below); `tool_choice: "required"`/forced-name → a best-effort system-prompt instruction (see below); `stop` → runner-side text matching, no CLI flag | `functions`, `function_call`, `n > 1`, `logprobs: true`, `top_logprobs`, `modalities` containing anything other than `"text"`, `audio` |
 
 **Why `logprobs`/`modalities` are conditionally rejected, not just ignored**:
 both default to the CLI's actual behavior (no logprobs, text-only), so the
@@ -391,9 +391,39 @@ calls back with the result appended to `messages`, same as it would
 against the real API. CLI-native tool use (Bash, Edit, ...) in the same
 turn runs and completes normally — it was never represented in the OpenAI
 response shape anyway — and only a client-declared call ever stops the
-turn. `tool_choice: "required"` or a forced named tool is rejected (400):
-there's no CLI-side way to force a specific call rather than just offering
-the tools, so a clear error beats a silent best-effort.
+turn.
+
+**`tool_choice: "required"`/forced-name tool — best-effort, not a
+guarantee.** There is no CLI flag that actually forces a tool call; the
+only lever is a system-prompt instruction appended to the turn ("you must
+call one of the client-declared tools" or, for a forced name, "you must
+call `<name>`"). For a forced named tool, `--allowedTools` is also
+narrowed to just that one tool — closer to deterministic than the generic
+case, since the model has nothing else it's approved to call — but
+neither is a hard guarantee the way real OpenAI's `required` is: the
+model can still, occasionally, respond with plain text instead. Both
+`tool_choice: "required"` and a forced name need at least one entry in
+`tools` (400 otherwise); a forced name must actually appear in `tools`
+(400 otherwise).
+
+**`stop` — one string or an array of up to 4, matched against the
+output text as it's generated**, not a CLI flag (none exists for this
+either). The runner tracks the accumulated text per message and checks it
+against every stop sequence on each chunk; on the earliest match, the CLI
+process is killed immediately (the same early-termination pattern tool
+calls use, so a stop match doesn't keep paying for tokens generated past
+it) and the response is truncated right before the match, with
+`finish_reason: "stop"`. One honestly-documented limitation: `usage` on a
+stop-triggered turn is necessarily partial (the CLI's own final token
+count arrives in an event this path never reaches, since the process is
+killed before it would fire) — `prompt_tokens` is still accurate,
+`completion_tokens` reflects only what had been reported at the moment of
+the match, not a full count. In streaming mode, a stop sequence that
+happens to split exactly across two delta chunks can leak a few
+characters to the client before the match completes and truncation
+catches up — real but rare given this CLI's chunking granularity;
+non-streaming responses have no such risk, since the full text is
+available before truncating.
 
 **Streaming**
 

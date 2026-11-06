@@ -24,6 +24,9 @@ const CLI_EFFORT_LEVELS = new Set(['low', 'medium', 'high', 'xhigh', 'max'])
 // function-name charset closes that off entirely.
 const TOOL_NAME_PATTERN = /^[A-Za-z0-9_-]{1,64}$/
 
+// OpenAI's own limit on how many stop sequences a single request may give.
+const STOP_MAX_COUNT = 4
+
 function hasOnlyTextParts(contentArray) {
   return contentArray.every((part) => part !== null && typeof part === 'object' && part.type === 'text' && typeof part.text === 'string')
 }
@@ -98,11 +101,8 @@ function validateRequest(body, sessionId, projectPath) {
 
   // tools: a client-declared tool is bridged through a per-request MCP stub
   // server and intercepted before the CLI would ever dispatch to it — see
-  // mcpBridge.js/claudeCliRunner.js. tool_choice only maps cleanly onto
-  // "offer the tools" (auto, the default) or "don't" (none); "required" or
-  // a forced named tool has no clean CLI-side equivalent, so it stays a
-  // clear 400 rather than a silent best-effort. functions/function_call
-  // (the deprecated aliases) are out of scope and stay rejected outright.
+  // mcpBridge.js/claudeCliRunner.js. functions/function_call (the
+  // deprecated aliases) are out of scope and stay rejected outright.
   if (Array.isArray(body.tools)) {
     const seenNames = new Set()
     for (const tool of body.tools) {
@@ -124,9 +124,55 @@ function validateRequest(body, sessionId, projectPath) {
       return { error: 'tools must not contain a NUL byte' }
     }
   }
-  if (body.tool_choice !== undefined && body.tool_choice !== 'auto' && body.tool_choice !== 'none') {
-    return { error: 'tool_choice must be one of auto, none — required/forced-tool selection is not supported' }
+
+  // tool_choice: "auto"/"none" map directly onto whether the MCP bridge is
+  // built at all. "required" and a forced named tool have no CLI flag that
+  // actually forces a call — there's no equivalent of a hard guarantee here
+  // — so both become a best-effort system-prompt instruction instead (see
+  // claudeCliRunner.js's requireToolUse/forcedToolName), not a silent
+  // no-op and not a 400. Both still need at least one tool to require.
+  let requireToolUse = false
+  let forcedToolName
+  if (body.tool_choice === undefined || body.tool_choice === 'auto' || body.tool_choice === 'none') {
+    // no-op
+  } else if (body.tool_choice === 'required') {
+    if (!Array.isArray(body.tools) || body.tools.length === 0) {
+      return { error: 'tool_choice "required" needs a non-empty tools array' }
+    }
+    requireToolUse = true
+  } else if (body.tool_choice?.type === 'function' && typeof body.tool_choice.function?.name === 'string') {
+    if (!Array.isArray(body.tools) || body.tools.length === 0) {
+      return { error: 'tool_choice naming a function needs a non-empty tools array' }
+    }
+    forcedToolName = body.tool_choice.function.name
+    if (!body.tools.some((t) => t.function?.name === forcedToolName)) {
+      return { error: 'tool_choice names a tool not present in tools' }
+    }
+    requireToolUse = true
+  } else {
+    return { error: 'tool_choice must be "auto", "none", "required", or {type: "function", function: {name}}' }
   }
+
+  // stop: checked against the accumulated output text as it's generated
+  // (see claudeCliRunner.js) — there's no CLI flag for this either, only a
+  // runner-side text match, truncating the response at the first hit.
+  let stopSequences
+  if (body.stop !== undefined) {
+    const rawStop = typeof body.stop === 'string' ? [body.stop] : body.stop
+    if (
+      !Array.isArray(rawStop) ||
+      rawStop.length === 0 ||
+      rawStop.length > STOP_MAX_COUNT ||
+      rawStop.some((s) => typeof s !== 'string' || s.length === 0)
+    ) {
+      return { error: `stop must be a non-empty string or an array of 1-${STOP_MAX_COUNT} non-empty strings` }
+    }
+    if (rawStop.some((s) => s.includes('\0'))) {
+      return { error: 'stop must not contain a NUL byte' }
+    }
+    stopSequences = rawStop
+  }
+
   if (Array.isArray(body.functions) && body.functions.length > 0) {
     return { error: 'functions is not supported (deprecated alias of tools)' }
   }
@@ -199,7 +245,7 @@ function validateRequest(body, sessionId, projectPath) {
 
   const activeTools = body.tool_choice === 'none' || !Array.isArray(body.tools) || body.tools.length === 0 ? null : body.tools
 
-  return { content, systemPrompt, effort, jsonSchema, tools: activeTools }
+  return { content, systemPrompt, effort, jsonSchema, tools: activeTools, requireToolUse, forcedToolName, stopSequences }
 }
 
 // Claude Code's own usage accounting splits input tokens into a fresh
@@ -264,7 +310,7 @@ export function createChatCompletionsRouter({ sessions, runner, timeoutMs, event
     }
 
     const { model } = req.body
-    const { content, systemPrompt, effort, jsonSchema, tools } = validation
+    const { content, systemPrompt, effort, jsonSchema, tools, requireToolUse, forcedToolName, stopSequences } = validation
     const stream = req.body.stream === true
 
     let session
@@ -304,6 +350,9 @@ export function createChatCompletionsRouter({ sessions, runner, timeoutMs, event
       jsonSchema,
       tools,
       agentMode,
+      requireToolUse,
+      forcedToolName,
+      stopSequences,
     }
 
     if (stream) {
