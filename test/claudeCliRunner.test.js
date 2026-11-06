@@ -121,6 +121,26 @@ describe('createClaudeCliRunner', () => {
     expect(args).not.toContain('--allowedTools')
   })
 
+  it('disallows Task on a tools-bearing turn (security review: unverified subagent risk mitigation)', () => {
+    const child = fakeChild()
+    const spawnFn = vi.fn(() => child)
+    const fakeCreateMcpBridge = vi.fn(() => ({ mcpConfigPath: '/tmp/fake/mcp-config.json', allowedToolNames: ['mcp__client-tools__get_weather'], cleanup: vi.fn() }))
+    const runner = createClaudeCliRunner(spawnFn, { createMcpBridge: fakeCreateMcpBridge })
+    const tools = [{ type: 'function', function: { name: 'get_weather', parameters: {} } }]
+    runner.runTurn({ content: 'hi', projectPath: '/app/workspace/proj', tools })
+    const [, args] = spawnFn.mock.calls[0]
+    expect(args[args.indexOf('--disallowedTools') + 1]).toBe('Task')
+  })
+
+  it('does not pass --disallowedTools when no tools are given', () => {
+    const child = fakeChild()
+    const spawnFn = vi.fn(() => child)
+    const runner = createClaudeCliRunner(spawnFn)
+    runner.runTurn({ content: 'hi', projectPath: '/app/workspace/proj' })
+    const [, args] = spawnFn.mock.calls[0]
+    expect(args).not.toContain('--disallowedTools')
+  })
+
   it('builds the mcp config via the injected createMcpBridge and calls its cleanup once the process closes', async () => {
     const child = fakeChild()
     const spawnFn = vi.fn(() => child)
@@ -454,6 +474,47 @@ describe('createClaudeCliRunner', () => {
     expect(outcome.isError).toBe(false)
   })
 
+  it('preserves preamble text alongside tool_calls, not just in streaming (security review #6)', async () => {
+    const child = fakeChild()
+    const spawnFn = vi.fn(() => child)
+    const runner = createClaudeCliRunner(spawnFn)
+    const { promise } = runner.runTurn({ content: 'hi', projectPath: '/app/workspace/proj' })
+
+    child.stdout.emit('data', messageStartLine('claude-sonnet-5'))
+    child.stdout.emit('data', deltaLine('Let me check '))
+    child.stdout.emit('data', deltaLine('the weather.'))
+    child.stdout.emit('data', toolUseStartLine(1, 'toolu_1', 'mcp__client-tools__get_weather'))
+    child.stdout.emit('data', inputJsonDeltaLine(1, '{"location":"Paris"}'))
+    child.stdout.emit('data', toolUseMessageDeltaLine({}))
+    const outcome = await promise
+
+    expect(outcome.text).toBe('Let me check the weather.')
+  })
+
+  it('reports tool_calls index as a 0-based ordinal among MCP blocks, not the raw Anthropic content-block index (security review #2)', async () => {
+    const child = fakeChild()
+    const spawnFn = vi.fn(() => child)
+    const runner = createClaudeCliRunner(spawnFn)
+    const onToolCallDelta = vi.fn()
+    const { promise } = runner.runTurn({ content: 'hi', projectPath: '/app/workspace/proj', onToolCallDelta })
+
+    // A text block occupies index 0 (model wrote "Let me check." before
+    // calling tools); the two MCP tool calls land at raw indices 1 and 2.
+    child.stdout.emit('data', toolUseStartLine(1, 'toolu_1', 'mcp__client-tools__get_weather'))
+    child.stdout.emit('data', inputJsonDeltaLine(1, '{"location":"Paris"}'))
+    child.stdout.emit('data', toolUseStartLine(2, 'toolu_2', 'mcp__client-tools__get_time'))
+    child.stdout.emit('data', inputJsonDeltaLine(2, '{"tz":"UTC"}'))
+    child.stdout.emit('data', toolUseMessageDeltaLine({}))
+    const outcome = await promise
+
+    expect(outcome.toolCalls).toEqual([
+      { index: 0, id: 'toolu_1', name: 'get_weather', arguments: '{"location":"Paris"}' },
+      { index: 1, id: 'toolu_2', name: 'get_time', arguments: '{"tz":"UTC"}' },
+    ])
+    expect(onToolCallDelta.mock.calls[0][0]).toMatchObject({ index: 0, id: 'toolu_1' })
+    expect(onToolCallDelta.mock.calls[2][0]).toMatchObject({ index: 1, id: 'toolu_2' })
+  })
+
   it('calls onToolCallDelta for each fragment, keyed by index, with id/name only on the first call', async () => {
     const child = fakeChild()
     const spawnFn = vi.fn(() => child)
@@ -501,6 +562,30 @@ describe('createClaudeCliRunner', () => {
     child.stdout.emit('data', toolUseStartLine(0, 'toolu_native', 'Bash'))
     child.stdout.emit('data', inputJsonDeltaLine(0, '{}'))
     // Second message: the client tool call that actually stops the turn.
+    child.stdout.emit('data', messageStartLine('claude-sonnet-5'))
+    child.stdout.emit('data', toolUseStartLine(0, 'toolu_mcp', 'mcp__client-tools__get_weather'))
+    child.stdout.emit('data', inputJsonDeltaLine(0, '{"location":"Paris"}'))
+    child.stdout.emit('data', toolUseMessageDeltaLine({}))
+    const outcome = await promise
+
+    expect(outcome.toolCalls).toEqual([{ index: 0, id: 'toolu_mcp', name: 'get_weather', arguments: '{"location":"Paris"}' }])
+  })
+
+  it('actually clears a dangling MCP block from a prior message on message_start (not just a native one — review found the above test a vacuous check of this)', async () => {
+    const child = fakeChild()
+    const spawnFn = vi.fn(() => child)
+    const runner = createClaudeCliRunner(spawnFn)
+    const { promise } = runner.runTurn({ content: 'hi', projectPath: '/app/workspace/proj' })
+
+    // First message: a real MCP block is opened but this message never gets
+    // its own tool_use stop (the exact case the reset must cover — a
+    // leftover entry in currentBlocks from a message that's already done).
+    child.stdout.emit('data', messageStartLine('claude-sonnet-5'))
+    child.stdout.emit('data', toolUseStartLine(1, 'toolu_leftover', 'mcp__client-tools__stale_call'))
+    child.stdout.emit('data', inputJsonDeltaLine(1, '{"x":1}'))
+    // Second message: a different MCP block that does stop the turn. If the
+    // reset didn't clear the first message's entry, this would resolve with
+    // two tool calls instead of one.
     child.stdout.emit('data', messageStartLine('claude-sonnet-5'))
     child.stdout.emit('data', toolUseStartLine(0, 'toolu_mcp', 'mcp__client-tools__get_weather'))
     child.stdout.emit('data', inputJsonDeltaLine(0, '{"location":"Paris"}'))

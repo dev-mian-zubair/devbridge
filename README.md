@@ -445,12 +445,16 @@ DevBridge directly. Two things to get right:
 
 ### Known limitations
 
-- Full-history replay means every call reprocesses the whole conversation
-  from scratch on the CLI side — there's no server-side prompt-cache reuse
-  across a growing conversation the way `--resume` gave you before. This
-  is the correct tradeoff for matching real OpenAI semantics (the client
-  owns history, the server holds none of it), not an oversight, but it is
-  real added cost on a long conversation.
+- Full-history replay means there's no CLI-side session to resume — each
+  call is a genuinely fresh process, with no server-held conversation
+  state between requests, matching real OpenAI semantics (the client owns
+  history, the server holds none of it). Anthropic's own prompt caching is
+  prefix-based, so a call whose replayed history shares an unchanged
+  prefix with an earlier call (the common case: a conversation that only
+  grows by appending) may still see `cache_read` hits on that prefix —
+  this hasn't been verified against a fresh `-p` process with no
+  `--resume`, so don't assume it either way without checking
+  `usage.prompt_tokens_details.cached_tokens` on your own calls.
 - A long-running turn that's actively streaming is still bounded by the
   same flat `EXEC_TIMEOUT_MS` as everything else, not an idle timer reset
   on each token — a legitimately long agentic turn can hit it.

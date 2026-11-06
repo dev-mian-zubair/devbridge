@@ -24,6 +24,53 @@ const CLI_EFFORT_LEVELS = new Set(['low', 'medium', 'high', 'xhigh', 'max'])
 // function-name charset closes that off entirely.
 const TOOL_NAME_PATTERN = /^[A-Za-z0-9_-]{1,64}$/
 
+function hasOnlyTextParts(contentArray) {
+  return contentArray.every((part) => part !== null && typeof part === 'object' && part.type === 'text' && typeof part.text === 'string')
+}
+
+// serializeHistory assumes every message has the shape OpenAI's own API
+// guarantees (an object; tool_calls entries with a real function.name/
+// arguments). A malformed message — a bare null in the array, a tool_calls
+// entry missing its function — would otherwise throw inside serializeHistory,
+// which Express 4 doesn't catch for an async handler: that's an unhandled
+// rejection that takes the whole server down, not just this one request.
+// Checking shape up front turns that into a clean 400. This also catches
+// non-text content parts (e.g. an image) before they're silently dropped —
+// the spec's anti-goal is a 400 there, never a best-effort loss of information.
+function validateMessageShapes(messages) {
+  for (const message of messages) {
+    if (message === null || typeof message !== 'object' || Array.isArray(message)) {
+      return 'each message must be an object'
+    }
+    const { role, content, tool_calls: toolCalls, tool_call_id: toolCallId } = message
+
+    if (Array.isArray(toolCalls)) {
+      for (const tc of toolCalls) {
+        if (
+          tc === null || typeof tc !== 'object' ||
+          typeof tc.id !== 'string' ||
+          tc.function === null || typeof tc.function !== 'object' ||
+          typeof tc.function.name !== 'string' ||
+          typeof tc.function.arguments !== 'string'
+        ) {
+          return 'each tool_calls entry must be {id, function: {name, arguments}}'
+        }
+      }
+    } else if (toolCalls !== undefined) {
+      return 'tool_calls must be an array'
+    }
+
+    if (role === 'tool' && (typeof toolCallId !== 'string' || toolCallId.length === 0)) {
+      return 'a tool message must have a string tool_call_id'
+    }
+
+    if (Array.isArray(content) && !hasOnlyTextParts(content)) {
+      return 'message content must be a string or an array of {type: "text", text} parts — other content types are not supported'
+    }
+  }
+  return null
+}
+
 function validateRequest(body, sessionId, projectPath) {
   if (typeof sessionId !== 'string' || sessionId.length === 0) {
     return { error: 'sessionId is required, as the X-Session-Id header or a body field' }
@@ -33,6 +80,11 @@ function validateRequest(body, sessionId, projectPath) {
   }
   if (!Array.isArray(body?.messages) || body.messages.length === 0) {
     return { error: 'a non-empty messages array with a last message of text content is required' }
+  }
+
+  const shapeError = validateMessageShapes(body.messages)
+  if (shapeError) {
+    return { error: shapeError }
   }
 
   const content = serializeHistory(body.messages)
@@ -326,7 +378,7 @@ export function createChatCompletionsRouter({ sessions, runner, timeoutMs, event
 
       sessions.recordResult(sessionId, { content: result.text, finishReason: mapFinishReason(result.stopReason), usage: mapUsage(result.usage) })
       const message = result.toolCalls?.length
-        ? { role: 'assistant', content: null, tool_calls: mapToolCalls(result.toolCalls), refusal: null }
+        ? { role: 'assistant', content: result.text || null, tool_calls: mapToolCalls(result.toolCalls), refusal: null }
         : { role: 'assistant', content: result.text, refusal: null }
       return res.json({
         id,

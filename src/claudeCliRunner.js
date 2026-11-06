@@ -43,6 +43,14 @@ function buildArgs({ model, systemPrompt, effort, jsonSchema, mcpConfigPath, all
   if (jsonSchema) args.push('--json-schema', JSON.stringify(jsonSchema))
   if (mcpConfigPath) {
     args.push('--mcp-config', mcpConfigPath, '--strict-mcp-config', '--allowedTools', ...allowedToolNames)
+    // Defensive: whether a native subagent's (Task tool) own tool calls are
+    // forwarded on this stream, and if so whether they're distinguishable
+    // from the top-level turn's, is unverified. Disallowing Task outright
+    // on any tools-bearing turn closes that off regardless of the answer —
+    // the interception's anti-goal (the stub handler must never actually
+    // run, and a turn must never end on the wrong tool call) is worth more
+    // here than a subagent's availability during tool-calling specifically.
+    args.push('--disallowedTools', 'Task')
   }
   return args
 }
@@ -130,10 +138,12 @@ export function createClaudeCliRunner(spawnFn = spawn, { killGraceMs = 5000, cre
           reject(err)
         }
 
-        // Blocks accumulated for the message currently in flight — reset at
-        // every message_start, so a client (MCP) tool call only reported in
-        // an earlier message of this turn never leaks into a later stop.
+        // Blocks (and any preamble text) accumulated for the message
+        // currently in flight — reset at every message_start, so a client
+        // (MCP) tool call or text only reported in an earlier message of
+        // this turn never leaks into a later stop.
         let currentBlocks = new Map()
+        let currentText = ''
 
         function handleLine(line) {
           let event
@@ -146,6 +156,7 @@ export function createClaudeCliRunner(spawnFn = spawn, { killGraceMs = 5000, cre
           if (event.type === 'stream_event' && event.event?.type === 'message_start') {
             capturedModel = event.event.message?.model ?? capturedModel
             currentBlocks = new Map()
+            currentText = ''
             return
           }
 
@@ -158,8 +169,17 @@ export function createClaudeCliRunner(spawnFn = spawn, { killGraceMs = 5000, cre
             const { index } = event.event
             const { id, name } = event.event.content_block
             const bareName = name.slice(MCP_PREFIX.length)
-            currentBlocks.set(index, { id, name: bareName, argsBuf: '' })
-            onToolCallDelta?.({ index, id, name: bareName, argumentsFragment: '' })
+            // The OpenAI tool_calls array is indexed 0-based, gaplessly,
+            // among tool calls only — never the raw Anthropic content-block
+            // index, which also counts any preceding text/native blocks in
+            // the same message (e.g. the model writing "Let me check."
+            // before calling a tool puts that tool_use block at index 1,
+            // not 0). `ordinal` is this block's position among MCP blocks
+            // seen so far in the current message; the raw `index` remains
+            // only the Map key used to correlate later delta events.
+            const ordinal = currentBlocks.size
+            currentBlocks.set(index, { id, name: bareName, argsBuf: '', ordinal })
+            onToolCallDelta?.({ index: ordinal, id, name: bareName, argumentsFragment: '' })
             return
           }
 
@@ -169,10 +189,10 @@ export function createClaudeCliRunner(spawnFn = spawn, { killGraceMs = 5000, cre
             event.event.delta?.type === 'input_json_delta' &&
             currentBlocks.has(event.event.index)
           ) {
-            const { index } = event.event
+            const block = currentBlocks.get(event.event.index)
             const fragment = event.event.delta.partial_json
-            currentBlocks.get(index).argsBuf += fragment
-            onToolCallDelta?.({ index, argumentsFragment: fragment })
+            block.argsBuf += fragment
+            onToolCallDelta?.({ index: block.ordinal, argumentsFragment: fragment })
             return
           }
 
@@ -181,15 +201,16 @@ export function createClaudeCliRunner(spawnFn = spawn, { killGraceMs = 5000, cre
             event.event?.type === 'content_block_delta' &&
             event.event.delta?.type === 'text_delta'
           ) {
+            currentText += event.event.delta.text
             onDelta?.(event.event.delta.text)
             return
           }
 
           if (event.type === 'stream_event' && event.event?.type === 'message_delta' && event.event.delta?.stop_reason === 'tool_use') {
             if (currentBlocks.size === 0) return
-            const toolCalls = [...currentBlocks.entries()].map(([index, b]) => ({ index, id: b.id, name: b.name, arguments: b.argsBuf }))
+            const toolCalls = [...currentBlocks.values()].map((b) => ({ index: b.ordinal, id: b.id, name: b.name, arguments: b.argsBuf }))
             settleResolve({
-              text: '',
+              text: currentText,
               usage: event.event.usage ?? null,
               totalCostUsd: null,
               claudeSessionId: null,

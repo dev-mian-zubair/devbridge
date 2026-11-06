@@ -108,6 +108,25 @@ describe('POST /v1/chat/completions', () => {
     expect(res.body.choices[0].message.content).toBeNull()
   })
 
+  it('preserves preamble text in the non-streaming tool_calls response, instead of discarding it (security review #6)', async () => {
+    const runner = fakeRunner()
+    const { app } = appWith(runner)
+    const reqPromise = request(app).post('/v1/chat/completions').send({
+      sessionId: 's1', projectPath: '/app/workspace/proj',
+      messages: [{ role: 'user', content: 'weather in paris?' }],
+      tools: [{ type: 'function', function: { name: 'get_weather', parameters: { type: 'object' } } }],
+    })
+    const [res] = await Promise.all([
+      reqPromise,
+      waitForPending(runner).then(() => runner.pending[0].resolve(outcome({
+        text: 'Let me check the weather.', stopReason: 'tool_use',
+        toolCalls: [{ index: 0, id: 'toolu_1', name: 'get_weather', arguments: '{"location":"Paris"}' }],
+      }))),
+    ])
+    expect(res.body.choices[0].message.content).toBe('Let me check the weather.')
+    expect(res.body.choices[0].message.tool_calls).toHaveLength(1)
+  })
+
   it('maps usage into prompt_tokens/completion_tokens/total_tokens', async () => {
     const runner = fakeRunner()
     const { app } = appWith(runner)
@@ -226,6 +245,56 @@ describe('POST /v1/chat/completions', () => {
     runner.pending[0].resolve(outcome())
     await reqPromise
     expect(runner.pending[0].opts.content).toBe('User: hello world')
+  })
+
+  it('returns 400 instead of crashing for a null entry in the messages array', async () => {
+    const runner = fakeRunner()
+    const { app } = appWith(runner)
+    const res = await request(app).post('/v1/chat/completions').send({
+      sessionId: 's1', projectPath: '/app/workspace/proj', messages: [null],
+    })
+    expect(res.status).toBe(400)
+    expect(res.body.error.type).toBe('invalid_request_error')
+  })
+
+  it('returns 400 instead of crashing for a tool_calls entry missing function', async () => {
+    const runner = fakeRunner()
+    const { app } = appWith(runner)
+    const res = await request(app).post('/v1/chat/completions').send({
+      sessionId: 's1', projectPath: '/app/workspace/proj',
+      messages: [
+        { role: 'user', content: 'hi' },
+        { role: 'assistant', content: null, tool_calls: [{ id: 'c1' }] },
+      ],
+    })
+    expect(res.status).toBe(400)
+    expect(res.body.error.type).toBe('invalid_request_error')
+  })
+
+  it('returns 400 for a tool message missing tool_call_id', async () => {
+    const runner = fakeRunner()
+    const { app } = appWith(runner)
+    const res = await request(app).post('/v1/chat/completions').send({
+      sessionId: 's1', projectPath: '/app/workspace/proj',
+      messages: [{ role: 'tool', content: 'result' }],
+    })
+    expect(res.status).toBe(400)
+    expect(res.body.error.type).toBe('invalid_request_error')
+  })
+
+  it('returns 400 for a non-text content part instead of silently dropping it (anti-goal)', async () => {
+    const runner = fakeRunner()
+    const { app } = appWith(runner)
+    const res = await request(app).post('/v1/chat/completions').send({
+      sessionId: 's1', projectPath: '/app/workspace/proj',
+      messages: [
+        { role: 'user', content: 'what is this?' },
+        { role: 'user', content: [{ type: 'image_url', image_url: { url: 'https://example.com/x.png' } }] },
+      ],
+    })
+    expect(res.status).toBe(400)
+    expect(res.body.error.type).toBe('invalid_request_error')
+    expect(runner.pending).toHaveLength(0)
   })
 
   it('rejects a model value with characters outside a safe alias charset', async () => {
