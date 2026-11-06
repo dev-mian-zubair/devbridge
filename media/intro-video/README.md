@@ -1,10 +1,15 @@
 # DevBridge intro video
 
 A self-contained [Remotion](https://remotion.dev) project that renders the
-~66s intro video embedded at the top of the main [README](../../README.md)
-(`docs/intro.mp4`, poster `docs/intro-poster.png`). Independent of
-DevBridge's own `package.json`/`node_modules` — this is its own npm
-project, nested here only for repo-locality.
+~66s intro video embedded at the top of the main [README](../../README.md).
+Independent of DevBridge's own `package.json`/`node_modules` — this is its
+own npm project, nested here only for repo-locality.
+
+GitHub doesn't play a repo-committed MP4 inline in a README (only a click-
+through link to it, or a video uploaded through its web editor), so the
+README embeds an animated GIF (`docs/intro.gif`) rendered from the video,
+with a link to the full-quality `docs/intro.mp4` (has audio; the GIF
+doesn't) alongside it.
 
 ## Rebuilding
 
@@ -14,11 +19,16 @@ npm run start   # Remotion Studio — preview/edit the composition
 npm run render  # renders out/intro.mp4
 ```
 
-After rendering, copy the result into the main repo's `docs/`:
+After rendering, copy the result into the main repo's `docs/` and
+regenerate the GIF:
 
 ```bash
 cp out/intro.mp4 ../../docs/intro.mp4
-npx remotion still src/index.ts Intro ../../docs/intro-poster.png --frame=60
+cd ../../docs
+ffmpeg -y -i intro.mp4 -vf "fps=10,scale=960:-1:flags=lanczos,palettegen=stats_mode=diff" /tmp/palette.png
+ffmpeg -y -i intro.mp4 -i /tmp/palette.png \
+  -lavfi "fps=10,scale=960:-1:flags=lanczos[x];[x][1:v]paletteuse=dither=bayer:bayer_scale=3" \
+  intro.gif
 ```
 
 ## Structure
