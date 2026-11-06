@@ -9,6 +9,12 @@ DevBridge is a local-only developer tool that wraps the official
 chat-completions endpoint, a WebSocket terminal stream, and a minimal admin
 dashboard — all in a single Docker container.
 
+[![Watch the 66-second intro](docs/intro-poster.png)](docs/intro.mp4)
+
+*(Click to watch — covers what DevBridge is, quick start, signing in, an
+API call, and framework support. Source: [`media/intro-video`](media/intro-video),
+a self-contained Remotion project.)*
+
 ![DevBridge dashboard](docs/screenshot.png)
 
 ## Contents
