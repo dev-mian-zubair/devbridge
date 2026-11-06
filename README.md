@@ -11,10 +11,10 @@ dashboard — all in a single Docker container.
 
 ![DevBridge intro](docs/intro.gif)
 
-*(66s overview — what DevBridge is, quick start, signing in, an API call,
-and framework support. Full quality with audio: [`docs/intro.mp4`](docs/intro.mp4).
-Source: [`media/intro-video`](media/intro-video), a self-contained Remotion
-project.)*
+*(A 15s highlight loop. Full 66s narrated version with audio — what
+DevBridge is, quick start, signing in, an API call, and framework support:
+[`docs/intro.mp4`](docs/intro.mp4). Source: [`media/intro-video`](media/intro-video),
+a self-contained Remotion project.)*
 
 ## Contents
 

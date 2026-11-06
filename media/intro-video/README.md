@@ -7,9 +7,11 @@ own npm project, nested here only for repo-locality.
 
 GitHub doesn't play a repo-committed MP4 inline in a README (only a click-
 through link to it, or a video uploaded through its web editor), so the
-README embeds an animated GIF (`docs/intro.gif`) rendered from the video,
-with a link to the full-quality `docs/intro.mp4` (has audio; the GIF
-doesn't) alongside it.
+README embeds a short animated GIF (`docs/intro.gif`, ~15s) cut from the
+video's more visually dynamic moments, with a link to the full 66s
+narrated `docs/intro.mp4` (has audio; the GIF doesn't, and the full video
+is too slow-paced as a silent loop — it was timed for narration) alongside
+it.
 
 ## Rebuilding
 
@@ -25,11 +27,26 @@ regenerate the GIF:
 ```bash
 cp out/intro.mp4 ../../docs/intro.mp4
 cd ../../docs
-ffmpeg -y -i intro.mp4 -vf "fps=10,scale=960:-1:flags=lanczos,palettegen=stats_mode=diff" /tmp/palette.png
-ffmpeg -y -i intro.mp4 -i /tmp/palette.png \
-  -lavfi "fps=10,scale=960:-1:flags=lanczos[x];[x][1:v]paletteuse=dither=bayer:bayer_scale=3" \
+
+# cut a few dynamic segments, speed them up ~1.4x, and re-encode (not -c copy —
+# stream-copy trims snap to keyframes and glitch at the splice points)
+ffmpeg -y -i intro.mp4 -filter_complex "\
+[0:v]trim=start=24:end=29.5,setpts=PTS-STARTPTS[v1]; \
+[0:v]trim=start=40:end=46.5,setpts=PTS-STARTPTS[v2]; \
+[0:v]trim=start=49.5:end=58,setpts=PTS-STARTPTS[v3]; \
+[v1][v2][v3]concat=n=3:v=1:a=0[vcat]; \
+[vcat]setpts=PTS/1.4[vout]" \
+-map "[vout]" -an highlight.mp4
+
+ffmpeg -y -i highlight.mp4 -vf "fps=14,scale=960:-1:flags=lanczos,palettegen=stats_mode=diff" /tmp/palette.png
+ffmpeg -y -i highlight.mp4 -i /tmp/palette.png \
+  -lavfi "fps=14,scale=960:-1:flags=lanczos[x];[x][1:v]paletteuse=dither=bayer:bayer_scale=3" \
   intro.gif
+rm highlight.mp4
 ```
+
+(Segment timestamps above match the current cut of the video — re-pick
+them if the scene timings change.)
 
 ## Structure
 
