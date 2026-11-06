@@ -1,9 +1,29 @@
 # DevBridge
 
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Node](https://img.shields.io/badge/node-%3E%3D20-brightgreen.svg)](package.json)
+[![Docker](https://img.shields.io/badge/docker-ready-2496ED.svg?logo=docker&logoColor=white)](Dockerfile)
+
 DevBridge is a local-only developer tool that wraps the official
 `@anthropic-ai/claude-code` CLI and exposes it as an OpenAI-compatible HTTP
 chat-completions endpoint, a WebSocket terminal stream, and a minimal admin
 dashboard — all in a single Docker container.
+
+*(Screenshot of the dashboard: add one at `docs/screenshot.png` and
+reference it here with `![DevBridge dashboard](docs/screenshot.png)`.)*
+
+## Contents
+
+- [Why this exists](#why-this-exists)
+- [Quick start](#quick-start)
+- [Architecture](#architecture)
+- [Running tests](#running-tests)
+- [Building and running the Docker image](#building-and-running-the-docker-image)
+- [Signing in (`/login` flow)](#signing-in-login-flow)
+- [API](#api)
+- [Examples](#examples)
+- [Non-functional / safety requirements](#non-functional--safety-requirements)
+- [License](#license)
 
 ## Why this exists
 
@@ -40,6 +60,40 @@ remote-controllable coding agent.
   are disallowed on every request, unconditionally — there is no header,
   field, or configuration that restores them. This is treated as a
   correctness property of the server, not a client-chosen default.
+
+## Quick start
+
+```bash
+git clone https://github.com/dev-mian-zubair/devbridge.git
+cd devbridge
+npm install
+npm start
+```
+
+Then sign in once (see [Signing in](#signing-in-login-flow)) and open
+`http://127.0.0.1:3000/` for the dashboard, or send a request straight to
+`http://127.0.0.1:3000/v1/chat/completions` (see [API](#api)). Everything
+else in this document — architecture, Docker, the full API reference — is
+there when you need it; this is the whole path to "it works".
+
+The server binds to `127.0.0.1:3000` by default. Configuration is read from
+environment variables — see `.env.example`:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PORT` | `3000` | HTTP port. |
+| `HOST` | `127.0.0.1` | Bind address. Keep this loopback outside Docker. |
+| `CLAUDE_CONFIG_DIR` | CLI default (`~/.claude`) | Where the CLI persists auth/session data. |
+| `EXEC_TIMEOUT_MS` | `120000` | Max time a single turn may run before it's killed. |
+| `READINESS_TIMEOUT_MS` | `5000` | Max time to wait for the login PTY to become ready. |
+| `READINESS_SETTLE_MS` | `250` | Quiet period used to decide the login PTY has finished its startup banner. |
+| `TRUSTED_HOSTS` | *(empty)* | Hostnames explicitly trusted besides `127.0.0.1`/`localhost`/`::1`. |
+
+`TRUSTED_HOSTS` is a comma-separated list of hostnames (no port — ports are
+ignored, same as the loopback check) for a gateway (LiteLLM, Open WebUI,
+...) running in its own container on a private network — see
+[Using with LiteLLM and other gateways](#using-with-litellm-and-other-openai-compatible-gateways).
+Never set it to a wildcard or to a hostname you don't control.
 
 ## Architecture
 
@@ -149,27 +203,6 @@ test/                     vitest + supertest; one test file per src/ module
                         terminal).
 Dockerfile                node:20-bookworm-slim + globally installed CLI.
 ```
-
-## Local development
-
-```bash
-npm install
-npm start
-```
-
-The server binds to `127.0.0.1:3000` by default. Open
-`http://127.0.0.1:3000/` for the dashboard. Configuration is read from
-environment variables — see `.env.example`:
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `PORT` | `3000` | HTTP port. |
-| `HOST` | `127.0.0.1` | Bind address. Keep this loopback outside Docker. |
-| `CLAUDE_CONFIG_DIR` | CLI default (`~/.claude`) | Where the CLI persists auth/session data. |
-| `EXEC_TIMEOUT_MS` | `120000` | Max time a single turn may run before it's killed. |
-| `READINESS_TIMEOUT_MS` | `5000` | Max time to wait for the login PTY to become ready. |
-| `READINESS_SETTLE_MS` | `250` | Quiet period used to decide the login PTY has finished its startup banner. |
-| `TRUSTED_HOSTS` | *(empty)* | Comma-separated hostnames (no port — ports are ignored, same as the loopback check) explicitly trusted in addition to `127.0.0.1`/`localhost`/`::1`. For a gateway (LiteLLM, Open WebUI, ...) running in its own container on a private network — see [Using with LiteLLM and other gateways](#using-with-litellm-and-other-openai-compatible-gateways). Never set this to a wildcard or to a hostname you don't control. |
 
 ## Running tests
 
@@ -386,7 +419,7 @@ falls into one of four buckets:
 
 | Supported & mapped | Accepted, silently ignored | Mapped to a real CLI flag | Rejected (400) |
 |---|---|---|---|
-| `model`, `messages`, `stream`, `stream_options.include_usage`, `tools`, `tool_choice` (all four forms), `stop` | `temperature`, `top_p`, `frequency_penalty`, `presence_penalty`, `logit_bias`, `seed`, `user`/`prompt_cache_key`, `metadata`, `store`, `service_tier`, `prediction`, `moderation`, `parallel_tool_calls`, `safety_identifier`, `max_tokens`/`max_completion_tokens`, `modalities: ["text"]`, `logprobs: false` | `reasoning_effort` → `--effort`; `response_format` (`json_schema` variant) → `--json-schema`; `tools` → a per-request `--mcp-config` (see below); `tool_choice: "required"`/forced-name → a best-effort system-prompt instruction (see below); `stop` → runner-side text matching, no CLI flag | `functions`, `function_call`, `n > 1`, `logprobs: true`, `top_logprobs`, `modalities` containing anything other than `"text"`, `audio` |
+| `model`, `messages`, `stream`, `stream_options.include_usage`, `tools`, `tool_choice` (all four forms), `stop` | `temperature`, `top_p`, `frequency_penalty`, `presence_penalty`, `logit_bias`, `seed`, `user`/`prompt_cache_key`, `metadata`, `store`, `service_tier`, `prediction`, `moderation`, `parallel_tool_calls`, `safety_identifier`, `max_tokens`/`max_completion_tokens`, `modalities: ["text"]`, `logprobs: false` | `reasoning_effort`, `response_format`, `tools`, `tool_choice`, `stop` (each explained below) | `functions`, `function_call`, `n > 1`, `logprobs: true`, `top_logprobs`, `modalities` containing anything other than `"text"`, `audio` |
 
 **Why `logprobs`/`modalities` are conditionally rejected, not just ignored**:
 both default to the CLI's actual behavior (no logprobs, text-only), so the
@@ -690,4 +723,4 @@ reconfigure away:
 
 ## License
 
-Private, unpublished project.
+MIT — see [`LICENSE`](LICENSE).
