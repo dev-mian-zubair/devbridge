@@ -1,0 +1,11 @@
+{
+  "name": "devbridge-example-basic-http",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node openai-sdk.mjs"
+  },
+  "dependencies": {
+    "openai": "^7.53.0"
+  }
+}

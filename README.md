@@ -13,9 +13,10 @@ make the *model* reachable the way any other LLM backend is reachable — a
 standard HTTP endpoint that takes OpenAI-style chat-completions requests,
 so local tools, scripts, and OpenAI-SDK-based applications (LangChain,
 LangGraph, the Vercel AI SDK, ...) can point at it like they would point at
-`api.openai.com`, without paying per-token API rates on top of a
-subscription you already have — while deliberately *not* exposing the
-CLI's own agentic capabilities (file access, shell execution) to do it.
+`api.openai.com` (see [Examples](#examples) below), without paying
+per-token API rates on top of a subscription you already have — while
+deliberately *not* exposing the CLI's own agentic capabilities (file
+access, shell execution) to do it.
 Every request is sandboxed away from those by default, with no way to opt
 back into them (see "Agent sandboxing" under
 [`POST /v1/chat/completions`](#post-v1chatcompletions) below) — this is a
@@ -643,6 +644,18 @@ otherwise) and types `/login` once it's ready. `login:input` forwards raw
 text to it — used for whatever paste-back step, if any, the flow needs.
 `login:complete` disposes it; so does the WS connection closing while a
 login is pending, and so does a safety timeout if neither fires.
+
+## Examples
+
+[`examples/`](examples) has minimal, runnable examples pointing real
+frameworks and SDKs at DevBridge: plain `curl` and the official `openai`
+SDK, the Vercel AI SDK, LangChain (with a full tool-calling round trip),
+and a Python deepagents agent. Each is self-contained with its own
+`package.json`/`requirements.txt`, and documents the one or two gotchas
+that framework has when pointed at a non-`api.openai.com` Chat Completions
+backend (e.g. the Vercel AI SDK's bare `openai()` provider silently
+targeting the Responses API, or deepagents' `"openai:..."` string
+shorthand ignoring any custom `base_url`).
 
 ## Non-functional / safety requirements
 

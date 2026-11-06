@@ -1,0 +1,12 @@
+{
+  "name": "devbridge-example-vercel-ai-sdk",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node index.mjs"
+  },
+  "dependencies": {
+    "@ai-sdk/openai-compatible": "^3.0.85",
+    "ai": "^7.0.163"
+  }
+}
